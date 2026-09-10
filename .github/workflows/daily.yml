@@ -1,0 +1,55 @@
+name: TSB4_Daily_Test_Automation_Flow
+
+on:
+  #schedule:
+   # - cron: '5 9 * * *'
+   # - cron: '20 2 * * *'
+  workflow_dispatch: # 讓您可以手動點擊 Run workflow 測試
+
+jobs:
+  automation_process:
+    runs-on: self-hosted # 指定在您的執行
+    steps:
+      - name: 1. 同步雲端腳本 (Checkout)
+        uses: actions/checkout@v4
+    
+      - name: 2. 執行測試 FW upgrade and case1 Factory default Onboarding
+        continue-on-error: true
+        run: python run_all_cases_like_github.py --only initial_wait,fw_upgrade
+
+      - name: 3. 執行測試 Case1, Case2
+        continue-on-error: true
+        run: python run_all_cases_like_github.py --only case1,case2
+        
+      - name: 4. 執行測試 Case3, Case4
+        continue-on-error: true
+        run: python run_all_cases_like_github.py --only case3,case4
+
+      - name: 5. 執行測試 Case5
+        continue-on-error: true
+        run: python run_all_cases_like_github.py --only case5
+
+      - name: 6. 執行測試 Case6 ~ Case9
+        continue-on-error: true
+        run: python run_all_cases_like_github.py --only case6,case7,case8,case9
+    
+      - name: 7. 執行測試 Case12 ~ Case14
+        continue-on-error: true
+        run: python run_all_cases_like_github.py --only case12,case13,case14
+
+      - name: 8. 執行測試 case10, Case11
+        continue-on-error: true
+        run: python run_all_cases_like_github.py --only case10,case11
+        
+      - name: 9. Crash Summary   
+        if: always()
+        run: python run_all_cases_like_github.py --only crash_summary
+
+      - name: 10. Collect All log 
+        if: always()
+        run: python run_all_cases_like_github.py --only collect
+
+      - name: 11. Final TSM4 GUI Factory Default
+        if: always()
+        run: python tsm4_gui_factory_default_standalone.py
+
