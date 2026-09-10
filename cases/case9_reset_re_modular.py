@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Case9 Reset RE onboarding test."""
+import argparse
+import os
+import sys
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from testlib import config as cfg
+from testlib.logger import init_log_filenames
+from testlib.serial_console import start_background_serial_logger, stop_background_serial_logger
+from cases._case_common import add_common_args, apply_common_args
+from cases._gui_action_case import run_gui_action_case
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Case9 Reset RE onboarding test")
+    add_common_args(parser)
+    parser.add_argument("--reboot-sync-wait", type=int, default=cfg.REBOOT_SYNC_WAIT)
+    parser.add_argument("--reset-init-wait", type=int, default=None, help="Backward compatibility: set both ETH/WiFi init wait")
+    parser.add_argument("--case9-eth-init-wait", type=int, default=cfg.CASE9_ETH_ONBOARDING_INIT_WAIT_TIME)
+    parser.add_argument("--case9-wifi-init-wait", type=int, default=cfg.CASE9_WIFI_ONBOARDING_INIT_WAIT_TIME)
+    parser.add_argument("--case9-max-total-limit", type=int, default=cfg.CASE9_MAX_TOTAL_LIMIT)
+    return parser.parse_args()
+
+
+def apply_args(args):
+    apply_common_args(args)
+    cfg.REBOOT_SYNC_WAIT = args.reboot_sync_wait
+    if args.reset_init_wait is not None:
+        cfg.CASE9_ETH_ONBOARDING_INIT_WAIT_TIME = args.reset_init_wait
+        cfg.CASE9_WIFI_ONBOARDING_INIT_WAIT_TIME = args.reset_init_wait
+    else:
+        cfg.CASE9_ETH_ONBOARDING_INIT_WAIT_TIME = args.case9_eth_init_wait
+        cfg.CASE9_WIFI_ONBOARDING_INIT_WAIT_TIME = args.case9_wifi_init_wait
+    cfg.CASE9_MAX_TOTAL_LIMIT = args.case9_max_total_limit
+
+
+if __name__ == "__main__":
+    cfg.TEST_CASE_NAME = "case9_Reset RE Onboarding"
+    args = parse_args()
+    apply_args(args)
+    init_log_filenames()
+    start_background_serial_logger()
+    exit_code = 1
+    try:
+        ok = run_gui_action_case(
+            cfg.XPATH_RESET_RE,
+            "Reset RE",
+            cfg.CASE9_MAX_TOTAL_LIMIT,
+            cfg.RESET_ONBOARDING_THRESHOLD,
+            cfg.CASE9_ETH_ONBOARDING_INIT_WAIT_TIME,
+            cfg.CASE9_WIFI_ONBOARDING_INIT_WAIT_TIME,
+            precheck_init_wait=cfg.CASE9_WIFI_PRECHECK_INIT_WAIT,
+            precheck_threshold=cfg.CASE9_WIFI_PRECHECK_THRESHOLD,
+            precheck_max_limit=cfg.CASE9_WIFI_PRECHECK_MAX_LIMIT,
+        )
+        exit_code = 0 if ok else 1
+    finally:
+        stop_background_serial_logger()
+    raise SystemExit(exit_code)
