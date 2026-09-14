@@ -47,7 +47,7 @@ def send_email(subject, body, attachments=None):
     receivers = [
     'bill_chen@arcadyan.com',
     ]
-    app_password = 'apthsnwksezkwtbo'
+    app_password = 'qscczpuildgotvji'
 
     if attachments is None:
         attachments = []
