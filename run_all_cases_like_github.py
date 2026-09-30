@@ -45,8 +45,8 @@ from typing import Iterable, Optional
 # ---------------------------------------------------------------------------
 
 # Set True if you want firmware upgrade before testing.
-ENABLE_FW_UPGRADE = True
-#ENABLE_FW_UPGRADE = False
+#ENABLE_FW_UPGRADE = True
+ENABLE_FW_UPGRADE = False
 
 # Default: continue all remaining cases even if one case fails.
 # When a case fails, the runner will run FAIL_WORKAROUND_COMMAND first.
