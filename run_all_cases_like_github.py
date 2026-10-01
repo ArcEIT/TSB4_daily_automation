@@ -222,6 +222,21 @@ def override_loops_in_steps(steps: list[Step], loops: int) -> None:
             pass  # no --loops in this command, skip
 
 
+def inject_bh_bssid_in_steps(steps: list[Step], bh_bssid: str) -> None:
+    """Append --bh-bssid <bssid> to case6~case9 commands (only those accept it)."""
+    target_keys = {"case6", "case7", "case8", "case9"}
+    for step in steps:
+        if step.key.lower() not in target_keys:
+            continue
+        if not step.command:
+            continue
+        if "--bh-bssid" in step.command:
+            idx = step.command.index("--bh-bssid")
+            step.command[idx + 1] = bh_bssid
+        else:
+            step.command.extend(["--bh-bssid", bh_bssid])
+
+
 def filter_steps(steps: list[Step], start_from: Optional[str], only: Optional[str]) -> list[Step]:
     steps = [s for s in steps if s.enabled]
 
@@ -256,6 +271,14 @@ def main() -> int:
             "If omitted, each step uses its own configured loop count."
         ),
     )
+    parser.add_argument(
+        "--bh-bssid", default=None, metavar="XX:XX:XX:XX:XX:XX",
+        help=(
+            "TSM4 5GHz BH BSSID for raspi5 beacon scan in case6~case9. "
+            "e.g. --bh-bssid 3E:D5:ED:9A:97:67. "
+            "Only injected into case6/case7/case8/case9 commands; other steps are unaffected."
+        ),
+    )
     args = parser.parse_args()
 
     continue_on_fail = CONTINUE_ON_FAIL_DEFAULT
@@ -269,6 +292,10 @@ def main() -> int:
     if args.loops is not None:
         override_loops_in_steps(steps, args.loops)
         print(f"[{ts()}] --loops override active: all case scripts will use --loops {args.loops}", flush=True)
+
+    if args.bh_bssid:
+        inject_bh_bssid_in_steps(steps, args.bh_bssid)
+        print(f"[{ts()}] --bh-bssid active: case6~case9 will scan raspi5 beacon for {args.bh_bssid}", flush=True)
 
     print_banner("TSB4 Python Daily Runner Start")
     print(f"[{ts()}] CONTINUE_ON_FAIL = {continue_on_fail}", flush=True)
