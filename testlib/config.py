@@ -75,6 +75,9 @@ RD_POLL_DEBUG_COMMANDS = [
     "chk_Status.sh",
 ]
 
+# Scan the case Console.log on FAIL and append the detected cause to Fail_Reason / Summary.log.
+CONSOLE_ANALYZER_ENABLE = True
+
 # Log file placeholders – set by each case script before logger.init_log_filenames().
 TEST_CASE_NAME   = "unknown_case"
 CASE_ID          = TEST_CASE_NAME
@@ -212,9 +215,9 @@ REBOOT_INIT_WAIT_TIME                = 120  # Backward-compat
 CASE6_ETH_ONBOARDING_INIT_WAIT_TIME  = 90
 CASE6_WIFI_ONBOARDING_INIT_WAIT_TIME = 220  # (was 240)
 CASE6_MAX_TOTAL_LIMIT                = NORMAL_MAX_TOTAL_LIMIT
-CASE6_WIFI_PRECHECK_INIT_WAIT        = 210   # Wait after relay OFF for booster to switch to WiFi BH
+CASE6_WIFI_PRECHECK_INIT_WAIT        = 180   # Wait after relay OFF for booster to switch to WiFi BH
 CASE6_WIFI_PRECHECK_THRESHOLD        = 1    # Only need 1 consecutive success to confirm WiFi BH up
-CASE6_WIFI_PRECHECK_MAX_LIMIT        = 600  # Max wait for pre-check (s)
+CASE6_WIFI_PRECHECK_MAX_LIMIT        = 540  # Max wait for pre-check (s)
 
 # XPATH – Case 6 / 7 / 8 / 9 (Mesh extender reboot / reset buttons, shared)
 XPATH_REBOOT_ALL = "/html/body/app-root/app-main-base/div/div/main/app-wifi-main/div/div/div/app-wifi-mesh/div/app-wifi-mesh-extenders/div/div/div[1]/button[1]"
@@ -239,9 +242,9 @@ CASE7_WIFI_PRECHECK_MAX_LIMIT        = 900
 CASE8_ETH_ONBOARDING_INIT_WAIT_TIME  = 160  # (was 130)
 CASE8_WIFI_ONBOARDING_INIT_WAIT_TIME = 190  # (was 200)
 CASE8_MAX_TOTAL_LIMIT                = NORMAL_MAX_TOTAL_LIMIT
-CASE8_WIFI_PRECHECK_INIT_WAIT        = 210
+CASE8_WIFI_PRECHECK_INIT_WAIT        = 150
 CASE8_WIFI_PRECHECK_THRESHOLD        = 1
-CASE8_WIFI_PRECHECK_MAX_LIMIT        = 600
+CASE8_WIFI_PRECHECK_MAX_LIMIT        = 540
 
 # =============================================================================
 # CASE 9 – GW Reset Single RE
@@ -475,6 +478,7 @@ RASPI5_SSH_HOST            = "192.168.0.173"   # raspi5 IP
 RASPI5_SSH_PORT            = 22
 RASPI5_SSH_USERNAME        = "root"
 RASPI5_SSH_PASSWORD        = "arcadyan"
+RASPI5_SERIAL_PORT         = "COM5"            # raspi5 serial port (fallback when SSH unreachable)
 RASPI5_AIR_CAPTURE_SCRIPT  = "/home/AirCapture/Runtime_DumpPackets.sh"
 RASPI5_AIR_CAPTURE_OUT_DIR = "/home/AirCapture"
 RASPI5_AIR_CAPTURE_LOCAL_DIR = "."            # Local dir to save pcap on FAIL

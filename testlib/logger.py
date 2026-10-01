@@ -74,12 +74,31 @@ def init_summary_log(router_fw, booster_fw):
             f.write("-" * 70 + "\n")
 
 
+def _enrich_reason_with_console(reason, status_form):
+    """Append console-log findings to a FAIL reason. Never raises; returns (reason, detail_block)."""
+    try:
+        if not getattr(cfg, "CONSOLE_ANALYZER_ENABLE", True) or "Console:" in reason:
+            return reason, ""
+        from . import console_analyzer
+        findings = console_analyzer.analyze(cfg.FULL_CONSOLE_LOG)
+        if not findings:
+            return reason, ""
+        # The email parser drops a second-line reason that contains '|', so use ';' for that form.
+        sep = " ; " if status_form else " | "
+        return reason + console_analyzer.format_reason_suffix(findings, sep), console_analyzer.format_detail_block(findings)
+    except Exception:
+        return reason, ""
+
+
 def write_summary(loop_str, interface_name, duration, result, reason, status=""):
     ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     line = (
         f"{ts:<20} | {loop_str:<8} | {interface_name:<12} | "
         f"{duration:<10} | {result:<8}\n"
     )
+    detail_block = ""
+    if result == "FAIL" and reason and reason not in ("None", "N/A", ""):
+        reason, detail_block = _enrich_reason_with_console(reason, bool(status))
     with open(cfg.SUMMARY_LOG, "a", encoding="utf-8") as f:
         f.write(line)
         if result == "FAIL" and reason and reason not in ("None", "N/A", ""):
@@ -94,6 +113,8 @@ def write_summary(loop_str, interface_name, duration, result, reason, status="")
                 f.write(f"\nFail_Reason ( {ctx} )\n{reason}\n")
             else:
                 f.write(f"\nFail_Reason: {reason}\n")
+    if detail_block:
+        append_summary_block(detail_block)
 
 
 def append_summary_block(text):
