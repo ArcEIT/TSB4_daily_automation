@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--case7-eth-init-wait", type=int, default=cfg.CASE7_ETH_ONBOARDING_INIT_WAIT_TIME)
     parser.add_argument("--case7-wifi-init-wait", type=int, default=cfg.CASE7_WIFI_ONBOARDING_INIT_WAIT_TIME)
     parser.add_argument("--case7-max-total-limit", type=int, default=cfg.CASE7_MAX_TOTAL_LIMIT)
+    parser.add_argument("--bh-bssid", default="", help="TSM4 5GHz BH BSSID for raspi5 beacon scan (e.g. 3E:D5:ED:9A:97:67). Leave empty to disable.")
     return parser.parse_args()
 
 
@@ -37,6 +38,7 @@ def apply_args(args):
         cfg.CASE7_ETH_ONBOARDING_INIT_WAIT_TIME = args.case7_eth_init_wait
         cfg.CASE7_WIFI_ONBOARDING_INIT_WAIT_TIME = args.case7_wifi_init_wait
     cfg.CASE7_MAX_TOTAL_LIMIT = args.case7_max_total_limit
+    cfg.CASE7_BH_BEACON_BSSID = args.bh_bssid.strip()
 
 
 if __name__ == "__main__":
@@ -57,6 +59,7 @@ if __name__ == "__main__":
             precheck_init_wait=cfg.CASE7_WIFI_PRECHECK_INIT_WAIT,
             precheck_threshold=cfg.CASE7_WIFI_PRECHECK_THRESHOLD,
             precheck_max_limit=cfg.CASE7_WIFI_PRECHECK_MAX_LIMIT,
+            bh_beacon_bssid=getattr(cfg, "CASE7_BH_BEACON_BSSID", "") or None,
         )
         exit_code = 0 if ok else 1
     finally:

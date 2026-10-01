@@ -21,6 +21,7 @@ from testlib.serial_console import receive_monitor
 from testlib.onboarding import run_polling_or_recover, poll_booster_console
 from testlib.ssh_client import get_cached_ssh_host, run_ssh_command
 from testlib.recovery import safe_handle_fail_recovery
+from testlib import bh_beacon_monitor
 
 
 def _verify_device_offline(label, timeout, poll_interval):
@@ -120,6 +121,8 @@ def execute_one_backhaul_test(
     precheck_max_limit=None,
     air_capture_bssid=None,
     skip_onboarding_poll=False,
+    skip_ssh_offline_verify=False,
+    bh_beacon_bssid=None,
 ):
     log_separator(f"LOOP {loop} - {interface_name} 測試開始")
 
@@ -135,6 +138,12 @@ def execute_one_backhaul_test(
         _precheck_init_wait = precheck_init_wait if precheck_init_wait is not None else cfg.CASE6_WIFI_PRECHECK_INIT_WAIT
         _precheck_threshold = precheck_threshold if precheck_threshold is not None else cfg.CASE6_WIFI_PRECHECK_THRESHOLD
         _precheck_max_limit = precheck_max_limit if precheck_max_limit is not None else cfg.CASE6_WIFI_PRECHECK_MAX_LIMIT
+
+        # ── BH Beacon Monitor: start scanning for TSM4 BH BSSID in background ──
+        if bh_beacon_bssid:
+            log_step(f"Loop {loop} {interface_name}: start BH beacon monitor (bssid={bh_beacon_bssid}, duration={_precheck_max_limit}s)")
+            bh_beacon_monitor.start(bh_beacon_bssid, _precheck_max_limit)
+
         log_step(
             f"Loop {loop} {interface_name}: WiFi BH pre-check "
             f"(init_wait={_precheck_init_wait}s, threshold={_precheck_threshold}, "
@@ -155,6 +164,24 @@ def execute_one_backhaul_test(
         if not precheck_ok:
             _base = f"Booster 未連回 TSM4 ({_precheck_max_limit}s)"
             fail_reason = f"{_base} | {_precheck_reason_out[0]}" if _precheck_reason_out else _base
+
+            # ── BH Beacon Monitor: check if TSM4 BH SSID was seen ──
+            if bh_beacon_bssid:
+                # Fetch air pcap BEFORE stop_and_check(), which calls _kill_and_cleanup()
+                # and deletes the pcap from raspi5.
+                _pcap_local_dir = os.path.dirname(
+                    os.path.abspath(getattr(cfg, "FULL_CONSOLE_LOG", "") or ".")
+                ) or "."
+                bh_beacon_monitor.fetch_pcap(_pcap_local_dir)
+                beacon_found, _ = bh_beacon_monitor.stop_and_check()
+                _log_dir = os.path.dirname(os.path.abspath(getattr(cfg, "FULL_CONSOLE_LOG", "") or "."))
+                _log_name = f"Loop{loop}_{interface_name.replace(' ', '_')}_PreCheck_bh_beacon.log"
+                bh_beacon_monitor.fetch_log(os.path.join(_log_dir, _log_name))
+                if beacon_found:
+                    fail_reason += f" | raspi5: TSM4 BH BSSID ({bh_beacon_bssid}) detected (GW OK, Booster issue)"
+                else:
+                    fail_reason += f" | raspi5: TSM4 BH BSSID ({bh_beacon_bssid}) NOT detected (GW BH not broadcasting)"
+
             write_summary(summary_loop_display(str(loop), interface_name), interface_name, "N/A", "FAIL", fail_reason)
             log_result(f"Loop {loop} {interface_name}: FAIL, Booster 未能透過 {backhaul_name} 連線，跳過 reboot 測試")
             log_progress(f"!! {interface_name} Pre-Check FAIL，Booster 未連上 {backhaul_name}，停止測試 !!")
@@ -163,6 +190,10 @@ def execute_one_backhaul_test(
                 restore_eth_bh=restore_eth_bh,
             )
             return False
+
+        # Pre-Check PASS: stop beacon monitor (cleanup, no need to keep)
+        if bh_beacon_bssid:
+            bh_beacon_monitor.stop_and_cleanup()
 
         log_result(f"Loop {loop} {interface_name}: Pre-Check PASS, Booster 已連上 {backhaul_name}，開始 reboot 測試")
 
@@ -187,46 +218,54 @@ def execute_one_backhaul_test(
 
     log_result(f"Loop {loop} {interface_name}: GUI action command sent ({action_label})")
 
-    for _offline_retry in range(cfg.REBOOT_OFFLINE_VERIFY_RETRIES + 1):
-        if _offline_retry > 0:
-            log_progress(
-                f"[{interface_name}] Reboot 指令已送出但裝置未下線，"
-                f"重送 GUI 指令 (retry {_offline_retry}/{cfg.REBOOT_OFFLINE_VERIFY_RETRIES})..."
-            )
-            _gui_ok2, duration_start_time = trigger_web_action(action_xpath, action_label, None)
-            if not _gui_ok2:
-                write_summary(summary_loop_display(str(loop), interface_name), interface_name, "N/A", "FAIL", "GUI Error (offline retry)")
-                log_result(f"Loop {loop} {interface_name}: FAIL, GUI Error on offline retry ({action_label})")
-                log_progress(f"!! {interface_name} offline retry GUI 操作失敗 !!")
-                if restore_eth_bh:
-                    log_step(f"Loop {loop} {interface_name}: restore ETH BH after GUI Error (offline retry)")
-                    restore_eth_backhaul(f"{interface_name} GUI Error (offline retry)")
-                return False
-
+    if skip_ssh_offline_verify:
+        # Skip SSH offline check — go straight to serial verify.
+        # Use this when the device reboots faster than REBOOT_SYNC_WAIT + SSH poll latency
+        # (e.g. Reset Router+Boosters where booster comes back up before SSH check starts).
         log_step(f"Loop {loop} {interface_name}: wait action sync, wait={cfg.REBOOT_SYNC_WAIT}s")
-        log_progress(f"等待 {cfg.REBOOT_SYNC_WAIT} 秒讓 Booster 確實收到指令...")
+        log_progress(f"等待 {cfg.REBOOT_SYNC_WAIT} 秒讓 Booster 確實收到指令（跳過 SSH offline verify）...")
         receive_monitor(cfg.REBOOT_SYNC_WAIT)
-
-        if _verify_device_offline(
-            f"Loop {loop} {interface_name}",
-            cfg.REBOOT_OFFLINE_VERIFY_TIMEOUT,
-            cfg.REBOOT_OFFLINE_POLL_INTERVAL,
-        ):
-            break
     else:
-        write_summary(
-            summary_loop_display(str(loop), interface_name), interface_name, "N/A", "FAIL",
-            f"Booster did not reboot: TSM4 '{action_label}' sent but Booster SSH still reachable ({cfg.REBOOT_OFFLINE_VERIFY_RETRIES + 1} attempts) - command not received"
-        )
-        log_result(
-            f"Loop {loop} {interface_name}: FAIL, "
-            f"送出 {cfg.REBOOT_OFFLINE_VERIFY_RETRIES + 1} 次 '{action_label}' 指令後 Booster SSH 仍可達，未收到指令"
-        )
-        log_progress(f"!! {interface_name} Reboot 指令送出後裝置未下線，停止測試 !!")
-        if restore_eth_bh:
-            log_step(f"Loop {loop} {interface_name}: restore ETH BH after Reboot Not Detected")
-            restore_eth_backhaul(f"{interface_name} Reboot Not Detected")
-        return False
+        for _offline_retry in range(cfg.REBOOT_OFFLINE_VERIFY_RETRIES + 1):
+            if _offline_retry > 0:
+                log_progress(
+                    f"[{interface_name}] Reboot 指令已送出但裝置未下線，"
+                    f"重送 GUI 指令 (retry {_offline_retry}/{cfg.REBOOT_OFFLINE_VERIFY_RETRIES})..."
+                )
+                _gui_ok2, duration_start_time = trigger_web_action(action_xpath, action_label, None)
+                if not _gui_ok2:
+                    write_summary(summary_loop_display(str(loop), interface_name), interface_name, "N/A", "FAIL", "GUI Error (offline retry)")
+                    log_result(f"Loop {loop} {interface_name}: FAIL, GUI Error on offline retry ({action_label})")
+                    log_progress(f"!! {interface_name} offline retry GUI 操作失敗 !!")
+                    if restore_eth_bh:
+                        log_step(f"Loop {loop} {interface_name}: restore ETH BH after GUI Error (offline retry)")
+                        restore_eth_backhaul(f"{interface_name} GUI Error (offline retry)")
+                    return False
+
+            log_step(f"Loop {loop} {interface_name}: wait action sync, wait={cfg.REBOOT_SYNC_WAIT}s")
+            log_progress(f"等待 {cfg.REBOOT_SYNC_WAIT} 秒讓 Booster 確實收到指令...")
+            receive_monitor(cfg.REBOOT_SYNC_WAIT)
+
+            if _verify_device_offline(
+                f"Loop {loop} {interface_name}",
+                cfg.REBOOT_OFFLINE_VERIFY_TIMEOUT,
+                cfg.REBOOT_OFFLINE_POLL_INTERVAL,
+            ):
+                break
+        else:
+            write_summary(
+                summary_loop_display(str(loop), interface_name), interface_name, "N/A", "FAIL",
+                f"Booster did not reboot: TSM4 '{action_label}' sent but Booster SSH still reachable ({cfg.REBOOT_OFFLINE_VERIFY_RETRIES + 1} attempts) - command not received"
+            )
+            log_result(
+                f"Loop {loop} {interface_name}: FAIL, "
+                f"送出 {cfg.REBOOT_OFFLINE_VERIFY_RETRIES + 1} 次 '{action_label}' 指令後 Booster SSH 仍可達，未收到指令"
+            )
+            log_progress(f"!! {interface_name} Reboot 指令送出後裝置未下線，停止測試 !!")
+            if restore_eth_bh:
+                log_step(f"Loop {loop} {interface_name}: restore ETH BH after Reboot Not Detected")
+                restore_eth_backhaul(f"{interface_name} Reboot Not Detected")
+            return False
 
     if skip_onboarding_poll:
         # Method 2: confirm reboot via serial log keywords
@@ -344,7 +383,7 @@ def run_gui_action_wifi_only_case(action_xpath, action_label, max_total_limit, t
                 pass
 
 
-def run_gui_action_case(action_xpath, action_label, max_total_limit, threshold=None, eth_init_wait=None, wifi_init_wait=None, precheck_init_wait=None, precheck_threshold=None, precheck_max_limit=None):
+def run_gui_action_case(action_xpath, action_label, max_total_limit, threshold=None, eth_init_wait=None, wifi_init_wait=None, precheck_init_wait=None, precheck_threshold=None, precheck_max_limit=None, bh_beacon_bssid=None):
     active_driver = None
     threshold = cfg.ONBOARDING_THRESHOLD if threshold is None else threshold
     log_step(f"{cfg.TEST_CASE_NAME}: GUI action case start ({action_label}), loops={cfg.TOTAL_LOOPS}")
@@ -380,6 +419,7 @@ def run_gui_action_case(action_xpath, action_label, max_total_limit, threshold=N
                 precheck_threshold=precheck_threshold,
                 precheck_max_limit=precheck_max_limit,
                 skip_onboarding_poll=True,
+                bh_beacon_bssid=bh_beacon_bssid,
             )
             if not wifi_pass:
                 log_result(f"{cfg.TEST_CASE_NAME}: Loop {loop} FAIL at WiFi BH")
@@ -540,6 +580,255 @@ def run_gui_action_wifi_bh_unit_case(
         log_progress(f"主程式發生未預期錯誤: {type(e).__name__}: {e}")
         raspi5_air_capture_auto_channel.stop_and_fetch(air_capture_local_dir)
         tcpdump_debug.stop_for_download()
+        return False
+    finally:
+        if active_driver is not None:
+            try:
+                active_driver.quit()
+            except Exception:
+                pass
+
+
+def run_gui_action_case_with_capture(
+    action_xpath, action_label, max_total_limit,
+    threshold=None,
+    eth_init_wait=None, wifi_init_wait=None,
+    precheck_init_wait=None, precheck_threshold=None, precheck_max_limit=None,
+    post_reset_wait=100,
+    air_capture_bssid=None, air_capture_local_dir=".",
+):
+    """Case7 flow (ETH BH → WiFi BH) with tcpdump + air-capture on the WiFi BH phase.
+
+    ETH BH phase  : same as original case7 (serial-verify reboot, no onboarding poll).
+    WiFi BH phase : precheck → GUI Reset → post_reset_wait → air capture → 5s →
+                    booster ath1 tcpdump → poll onboarding.
+                    PASS → stop & delete captures.
+                    FAIL → stop booster tcpdump (diag already collected inside
+                           run_polling_or_recover) + fetch raspi5 air pcap.
+    """
+    active_driver = None
+    threshold = cfg.RESET_ONBOARDING_THRESHOLD if threshold is None else threshold
+
+    log_step(f"{cfg.TEST_CASE_NAME}: case_with_capture start ({action_label}), loops={cfg.TOTAL_LOOPS}")
+    try:
+        router_fw, active_driver = get_router_fw_version()
+        log_step(
+            f"{cfg.TEST_CASE_NAME}: wait before GUI action navigation, "
+            f"wait={cfg.GW_FW_TO_GUI_ACTION_SLEEP}s"
+        )
+        log_progress(
+            f"GW FW 取得完成，保留 Chrome，等待 {cfg.GW_FW_TO_GUI_ACTION_SLEEP} 秒後繼續..."
+        )
+        receive_monitor(cfg.GW_FW_TO_GUI_ACTION_SLEEP)
+        booster_fw = get_booster_fw_version()
+
+        init_summary_log(router_fw, booster_fw)
+        log_separator(f"自動化測試啟動 (共計 {cfg.TOTAL_LOOPS} Loops) - {cfg.TEST_CASE_NAME}")
+        log_progress(
+            "Fail policy: ETH BH FAIL stops script; WiFi BH FAIL → diag + capture fetch → stop."
+        )
+
+        for loop in range(1, cfg.TOTAL_LOOPS + 1):
+            raspi5_air_capture_auto_channel.reset()
+            log_step(f"{cfg.TEST_CASE_NAME}: Loop {loop} start")
+
+            # ── ETH BH phase (same as original case7) ─────────────────────────
+            # ETH BH pass criteria: booster received Reset and rebooted.
+            # Serial verify confirms reboot; no onboarding poll needed.
+            eth_pass = execute_one_backhaul_test(
+                loop, "ETH BH", "on", action_xpath, action_label,
+                max_total_limit, threshold, active_driver, eth_init_wait,
+                skip_onboarding_poll=True,
+                skip_ssh_offline_verify=True,
+            )
+            active_driver = None
+            if not eth_pass:
+                log_result(f"{cfg.TEST_CASE_NAME}: Loop {loop} FAIL at ETH BH")
+                log_progress(f"LOOP {loop} ETH BH FAIL，停止測試。")
+                return False
+
+            # ── WiFi BH phase: precheck ────────────────────────────────────────
+            log_step(f"Loop {loop} WiFi BH: pre-switch relay off for precheck")
+            log_progress("STEP: 切換 Relay OFF，等待 Booster 透過 WiFi BH 連回...")
+            control_relay("off")
+            receive_monitor(cfg.RELAY_SETTLE_TIME)
+
+            _precheck_init_wait = (
+                precheck_init_wait if precheck_init_wait is not None
+                else cfg.CASE7_WIFI_PRECHECK_INIT_WAIT
+            )
+            _precheck_threshold = (
+                precheck_threshold if precheck_threshold is not None
+                else cfg.CASE7_WIFI_PRECHECK_THRESHOLD
+            )
+            _precheck_max_limit = (
+                precheck_max_limit if precheck_max_limit is not None
+                else cfg.CASE7_WIFI_PRECHECK_MAX_LIMIT
+            )
+            log_step(
+                f"Loop {loop} WiFi BH Pre-Check "
+                f"(init_wait={_precheck_init_wait}s, threshold={_precheck_threshold}, "
+                f"max_limit={_precheck_max_limit}s)"
+            )
+            log_progress("STEP: 確認 Booster 已透過 WiFi BH 連線，才進行 Reset 測試...")
+            _precheck_reason_out = []
+            precheck_ok = poll_booster_console(
+                str(loop),
+                "WiFi BH Pre-Check",
+                _precheck_init_wait,
+                _precheck_threshold,
+                max_total_limit=_precheck_max_limit,
+                write_summary_on_pass=False,
+                write_summary_on_fail=False,
+                reason_out=_precheck_reason_out,
+            )
+            if not precheck_ok:
+                _base = f"Booster 未連回 TSM4 WiFi BH ({_precheck_max_limit}s)"
+                fail_reason = (
+                    f"{_base} | {_precheck_reason_out[0]}" if _precheck_reason_out else _base
+                )
+                write_summary(
+                    summary_loop_display(str(loop), "WiFi BH"),
+                    "WiFi BH", "N/A", "FAIL", fail_reason,
+                )
+                log_result(f"Loop {loop} WiFi BH: FAIL, Booster 未連上 WiFi BH，停止測試")
+                log_progress("!! WiFi BH Pre-Check FAIL，Booster 未連上 WiFi BH，停止測試 !!")
+                safe_handle_fail_recovery(
+                    f"Loop{loop}_WiFi_BH_PreCheck_Fail",
+                    restore_eth_bh=False,
+                )
+                # tcpdump was auto-triggered at relay switch (deferred 60s);
+                # safe_handle_fail_recovery stopped it but didn't fetch the pcap.
+                # Fetch it now so the capture is available for analysis.
+                tcpdump_debug.stop_for_download()
+                # air capture was never started at precheck stage, stop_and_fetch is a no-op.
+                raspi5_air_capture_auto_channel.stop_and_fetch(air_capture_local_dir)
+                return False
+
+            log_result(f"Loop {loop} WiFi BH: Pre-Check PASS，開始 Reset 測試")
+
+            # ── WiFi BH phase: GUI Reset ───────────────────────────────────────
+            log_step(f"Loop {loop} WiFi BH: GUI action start ({action_label})")
+            log_progress(f"STEP: 執行 WiFi BH Reset（GUI 觸發 {action_label}）")
+            gui_ok, duration_start_time = trigger_web_action(action_xpath, action_label, None)
+            if not gui_ok:
+                write_summary(
+                    summary_loop_display(str(loop), "WiFi BH"),
+                    "WiFi BH", "N/A", "FAIL", "GUI Error",
+                )
+                log_result(f"Loop {loop} WiFi BH: FAIL, GUI Error ({action_label})")
+                log_progress("!! WiFi BH GUI 操作失敗，停止測試 !!")
+                return False
+
+            log_result(f"Loop {loop} WiFi BH: GUI action sent ({action_label})")
+
+            # ── WiFi BH phase: post-reset wait (TSM4 reboot + raspi5 LAN) ─────
+            log_step(
+                f"Loop {loop} WiFi BH: post-reset wait {post_reset_wait}s "
+                "(TSM4 reboot + raspi5 LAN recovery)"
+            )
+            log_progress(
+                f"等待 {post_reset_wait}s 讓 TSM4 重啟、raspi5 恢復 LAN 連線..."
+            )
+            receive_monitor(post_reset_wait)
+
+            # ── WiFi BH phase: start raspi5 air capture ───────────────────────
+            if air_capture_bssid:
+                log_step(
+                    f"Loop {loop} WiFi BH: start raspi5 air capture "
+                    f"(bssid={air_capture_bssid})"
+                )
+                raspi5_air_capture_auto_channel.start(air_capture_bssid)
+
+            # ── WiFi BH phase: wait 5s then start booster ath1 tcpdump ────────
+            receive_monitor(5)
+            log_step(f"Loop {loop} WiFi BH: start booster tcpdump (ath1)")
+            tcpdump_debug.start_wifi_bh_tcpdump()
+
+            # ── WiFi BH phase: poll onboarding ────────────────────────────────
+            log_step(
+                f"Loop {loop} WiFi BH: onboarding poll "
+                f"(init_wait={wifi_init_wait}s, threshold={threshold}, max={max_total_limit}s)"
+            )
+            result = run_polling_or_recover(
+                loop, "WiFi BH",
+                wifi_init_wait, threshold,
+                "WiFi_BH_Fail",
+                duration_start_time=duration_start_time,
+                max_total_limit=max_total_limit,
+                restore_eth_bh=False,
+                show_loop_number=True,
+            )
+
+            if result:
+                tcpdump_debug.stop_and_cleanup_wifi_bh_tcpdump()
+                raspi5_air_capture_auto_channel.stop_and_delete()
+                log_result(f"{cfg.TEST_CASE_NAME}: Loop {loop} PASS")
+                log_progress(f"LOOP {loop} PASS。")
+            else:
+                # run_polling_or_recover already ran safe_handle_fail_recovery
+                # (stopped booster tcpdump + ran check_RE_status + collected diag)
+                raspi5_air_capture_auto_channel.stop_and_fetch(air_capture_local_dir)
+                log_result(f"{cfg.TEST_CASE_NAME}: Loop {loop} FAIL at WiFi BH")
+                log_progress(f"LOOP {loop} WiFi BH FAIL，停止測試。")
+                return False
+
+            # ── Cooldown between loops ─────────────────────────────────────────
+            if loop < cfg.TOTAL_LOOPS:
+                log_step(
+                    f"{cfg.TEST_CASE_NAME}: Loop {loop} cooldown, "
+                    f"restore ETH BH, wait={cfg.LOOP_ETH_RESTORE_WAIT}s"
+                )
+                log_progress(
+                    f"LOOP {loop} 完成，恢復 ETH BH，等待 {cfg.LOOP_ETH_RESTORE_WAIT}s 讓 Booster 穩定..."
+                )
+                restore_eth_backhaul(f"Loop {loop} cooldown")
+                receive_monitor(cfg.LOOP_ETH_RESTORE_WAIT)
+                log_step(
+                    f"{cfg.TEST_CASE_NAME}: Loop {loop} cooldown post-check, "
+                    f"verify Booster onboard before Loop {loop + 1}"
+                )
+                log_progress(
+                    f"LOOP {loop} cooldown: 確認 Booster 已 onboard (ETH BH)，才開始 Loop {loop + 1}..."
+                )
+                cooldown_ok = poll_booster_console(
+                    str(loop),
+                    "Loop Cooldown ETH BH",
+                    0,
+                    cfg.ONBOARDING_THRESHOLD,
+                    max_total_limit=cfg.NORMAL_MAX_TOTAL_LIMIT,
+                    write_summary_on_pass=False,
+                    write_summary_on_fail=False,
+                )
+                if not cooldown_ok:
+                    log_result(
+                        f"{cfg.TEST_CASE_NAME}: Loop {loop} cooldown post-check FAIL，"
+                        "Booster 未 onboard，停止測試"
+                    )
+                    log_progress(
+                        f"LOOP {loop} cooldown Booster 未連線，無法繼續 Loop {loop + 1}，停止測試。"
+                    )
+                    return False
+
+        log_step(f"{cfg.TEST_CASE_NAME}: all loops PASS, restore ETH BH")
+        restore_eth_backhaul("測試 PASS 結束")
+        log_result(f"{cfg.TEST_CASE_NAME}: PASS")
+        log_separator("所有測試迴圈執行完畢，結果 PASS")
+        return True
+
+    except KeyboardInterrupt:
+        log_result(f"{cfg.TEST_CASE_NAME}: interrupted by user")
+        log_progress("使用者中斷測試。")
+        raspi5_air_capture_auto_channel.stop_and_fetch(air_capture_local_dir)
+        tcpdump_debug.stop_for_download()
+        restore_eth_backhaul("使用者中斷")
+        return False
+    except Exception as e:
+        log_result(f"{cfg.TEST_CASE_NAME}: FAIL, unexpected error {type(e).__name__}: {e}")
+        log_progress(f"主程式發生未預期錯誤: {type(e).__name__}: {e}")
+        raspi5_air_capture_auto_channel.stop_and_fetch(air_capture_local_dir)
+        tcpdump_debug.stop_for_download()
+        restore_eth_backhaul("主程式未預期錯誤")
         return False
     finally:
         if active_driver is not None:
