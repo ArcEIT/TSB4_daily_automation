@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 _SWITCH_RE = re.compile(r"Switch backhaul: (ETH|WiFi) BH")
 _POLL_TIMEOUT_RE = re.compile(r"PROGRESS-RESULT\] >>> .*: FAIL, timeout, max_total_limit=")
 _FINAL_FAIL_RE = re.compile(r"PROGRESS-RESULT\] >>> .*: FAIL, Final Check Fail")
+_RECOVERY_RE = re.compile(r"PROGRESS-STEP\] >>> Fail recovery start:")
+_RESTORE_RE = re.compile(r"PROGRESS-STEP\] >>> Restore ETH BH: reason=")
 _RD_RE = re.compile(r"^\[RD DEBUG\]  (.*)$")
 _STATE_RE = re.compile(r"Onboarding : (\w*)\s+Uptime: (\d{2}):(\d{2}):(\d{2})")
 _PS_RE = re.compile(r"^(\d+) root\s+\d+\s+\S+\s+(.*)$")
@@ -57,6 +59,14 @@ def _stage_window(lines, stage="fail"):
         if _POLL_TIMEOUT_RE.search(lines[i]):
             end = i + 1
             break
+    else:
+        # No polling timeout (e.g. command-not-received / sync FAIL): the failed stage ends where the fail recovery or
+        # the ETH BH restore starts. At write_summary time neither has happened yet, so this only matters for offline runs.
+        for pattern in (_RECOVERY_RE, _RESTORE_RE):
+            hit = next((i for i in range(n - 1, -1, -1) if pattern.search(lines[i])), None)
+            if hit is not None:
+                end = hit
+                break
     start = 0
     for i in range(end - 1, -1, -1):
         if _SWITCH_RE.search(lines[i]):
@@ -270,7 +280,174 @@ def rule_wifi_connected_no_ip(lines):
     return Finding("wifi_connected_no_ip", summary, evidence)
 
 
-RULES = [rule_repacd_restart_loop, rule_wifi_connected_no_ip]
+_SERIAL_TS_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} (\d{2}):(\d{2}):(\d{2})\.\d+ \[SERIAL\] (.*)$")
+_RADAR_RE = re.compile(r"Radar found on channel=(\d+).*Primary beaconning chan:(\d+)")
+_RADAR_STA_DOWN_RE = re.compile(r"mlme_vdev_sm_radar_notify: Bring down STA vdev")
+_STA_CONNECT_RE = re.compile(r"Connecting to \S+ ([0-9a-fA-F:]{17}) .*?freq: (\d+)")
+_STA_DISCONNECT_RE = re.compile(r"mlme_cm_disconnect_rsp: Disconnect Resp: .*Reason: (\d+)")
+_BH_DROP_MIN_GAP = 30  # seconds a BH drop must last to be reported
+
+
+def _serial_events(lines, regex):
+    """(PC clock seconds, regex match) for timestamped [SERIAL] lines only.
+
+    The untimestamped [RD DEBUG] dmesg tails repeat the same kernel lines; skipping them avoids double counting."""
+    out = []
+    for raw in lines:
+        s = _SERIAL_TS_RE.match(raw)
+        if not s:
+            continue
+        m = regex.search(s.group(4))
+        if m:
+            out.append((int(s.group(1)) * 3600 + int(s.group(2)) * 60 + int(s.group(3)), m))
+    return out
+
+
+def _is_wifi_bh_window(lines):
+    """True when the analyzed stage started with 'Switch backhaul: WiFi BH' (relay OFF).
+
+    In an ETH BH stage the RE's WiFi STA is torn down on purpose (gwmon 'Trigger Disconnect on all links'), so
+    STA connect/disconnect and radar-driven STA drops say nothing about the backhaul there."""
+    return bool(lines) and "Switch backhaul: WiFi BH" in lines[0]
+
+
+def rule_re_radar_bh_down(lines):
+    """The RE's own 5G AP hit a DFS radar event and the driver brought the BH STA (ath1) down with it."""
+    if not _is_wifi_bh_window(lines):
+        return None
+    radar = _serial_events(lines, _RADAR_RE)
+    sta_down = _serial_events(lines, _RADAR_STA_DOWN_RE)
+    if not radar or not sta_down:
+        return None
+
+    chans = sorted({f"ch{m.group(1)}" for _, m in radar})
+    prim = sorted({m.group(2) for _, m in radar})
+    first, last = radar[0][0], radar[-1][0]
+    span_text = _clock(first) if first == last else f"{_clock(first)}~{_clock(last)}"
+    down_text = "每次" if len(sta_down) >= len(radar) else f"其中 {len(sta_down)} 次"
+    summary = (
+        f"RE 5G AP 偵測到 DFS 雷達 {'/'.join(chans)} x{len(radar)} ({span_text}), "
+        f"{down_text} Bring down STA(ath1) 使 WiFi BH 中斷"
+    )
+    evidence = [
+        f"Radar found on channel={'/'.join(c[2:] for c in chans)} (RE 5G AP primary ch{'/'.join(prim)}): {len(radar)} 次, "
+        f"PC clock {', '.join(_clock(t) for t, _ in radar[:8])}{'...' if len(radar) > 8 else ''}",
+        f"driver 隨後 'mlme_vdev_sm_radar_notify: Bring down STA vdev id:1': {len(sta_down)} 次 (BH STA ath1 與同一顆 5G radio 的 AP 一起被拉掉)",
+        "說明: 僅表示 RE 端偵測到雷達並使 BH STA 掉線, 無法判斷是真雷達或誤判, 也無法判斷 TSM4 BH 當時是否在廣播 (需 air pcap)",
+        "來源: Console.log 帶時間戳的 [SERIAL] kernel log",
+    ]
+    return Finding("re_radar_bh_down", summary, evidence)
+
+
+def rule_bh_reconnect_loop(lines):
+    """ath1 associated to the TSM4 BH, was disconnected, and had to associate again."""
+    if not _is_wifi_bh_window(lines):
+        return None
+    connects = _serial_events(lines, _STA_CONNECT_RE)
+    drops = _serial_events(lines, _STA_DISCONNECT_RE)
+    if not drops or not connects:
+        return None
+    # A drop followed by a reconnect within a few seconds is a normal transition (e.g. WPS switching
+    # to the real credentials); only count drops that stayed down for a while or never recovered.
+    drops = [
+        d for d in drops
+        if next((c for c, _ in connects if c > d[0]), None) is None
+        or (next(c for c, _ in connects if c > d[0]) - d[0]) % 86400 >= _BH_DROP_MIN_GAP
+    ]
+    if not drops:
+        return None
+
+    relay_off_t = None
+    if lines and "Switch backhaul: WiFi BH" in lines[0]:
+        ts = _MARKER_TS_RE.match(lines[0])
+        if ts:
+            relay_off_t = int(ts.group(1)) * 3600 + int(ts.group(2)) * 60 + int(ts.group(3))
+
+    reasons = sorted({m.group(1) for _, m in drops})
+    chans = sorted({m.group(2) for _, m in connects})
+    last_conn = connects[-1][0]
+    last_drop = drops[-1][0]
+    settled = last_conn > last_drop
+    tail = (f"最後一次連線 {_clock(last_conn)} 後未再斷線" if settled
+            else f"最後一次斷線 {_clock(last_drop)} 後 BH 未再連上")
+    summary = (
+        f"WiFi BH 連上後被斷線 x{len(drops)} (Reason {'/'.join(reasons)}), "
+        f"共連線 {len(connects)} 次, 首次連上 {_clock(connects[0][0])}, {tail}"
+    )
+
+    evidence = [
+        f"ath1 'Connecting to' (BH BSSID {', '.join(sorted({m.group(1).lower() for _, m in connects}))}, freq {'/'.join(chans)} MHz): "
+        f"{len(connects)} 次, PC clock {', '.join(_clock(t) for t, _ in connects[:8])}",
+        f"ath1 'Disconnect Resp': {len(drops)} 次, PC clock {', '.join(_clock(t) + ' Reason ' + m.group(1) for t, m in drops[:8])}",
+    ]
+    gaps = []
+    for t, _ in drops:
+        nxt = next((c for c, _ in connects if c > t), None)
+        if nxt is not None:
+            gaps.append(f"{_clock(t)} 斷線 -> {_clock(nxt)} 重連 ({(nxt - t) % 86400}s)")
+    if gaps:
+        evidence.append("斷線到重新連上: " + "; ".join(gaps))
+    if relay_off_t is not None:
+        evidence.append(
+            f"首次連上為 relay OFF 後約 {(connects[0][0] - relay_off_t) % 86400}s, "
+            f"最後一次連線為 {(last_conn - relay_off_t) % 86400}s"
+        )
+    note = "說明: 僅表示 ath1 連線被結束, 無法由 RE log 判斷是 TSM4 或 RE 端觸發"
+    if "8" in reasons:
+        note += "; Reason 8 = IEEE 802.11 'Disassociated because sending STA is leaving BSS'"
+    evidence.append(note)
+    evidence.append("來源: Console.log 帶時間戳的 [SERIAL] kernel log (cm_id Connecting to / mlme_cm_disconnect_rsp)")
+    return Finding("bh_reconnect_loop", summary, evidence)
+
+
+_CTRL_CHECK_EMPTY_RE = re.compile(r"Checking (\d+) (?:if new|more than \d+ .*?restart new) Controller -- vs --")
+_CTRL_CHECK_KNOWN_RE = re.compile(r"Checking \d+ if new Controller -[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}-")
+_CTRL_RESTART_RE = re.compile(r"more than \d+ .*?restart new Controller -- vs --")
+_DAEMON_START_RE = re.compile(r"\[SERIAL\] (ezmesh|wsplcd): starting daemon")
+_CLOCK_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})")
+
+
+def rule_re_controller_missing(lines):
+    """The RE never found its MAP controller (the TSM4): its own check prints 'Controller -- vs --' (both ids empty).
+
+    Such an RE is not managed by the TSM4, so TSM4 commands (Reboot/Reset Boosters) and settings (SSID/key, FH
+    enable/disable) never reach it, whatever the test tried to verify."""
+    empty, restarts, daemons, known_after = [], 0, 0, False
+    for raw in lines:
+        if _CTRL_CHECK_KNOWN_RE.search(raw):
+            known_after = True       # a later check saw a real controller id
+            continue
+        m = _CTRL_CHECK_EMPTY_RE.search(raw)
+        if m:
+            known_after = False
+            c = _CLOCK_RE.match(raw)
+            empty.append((c.group(1) if c else "", int(m.group(1))))
+            if _CTRL_RESTART_RE.search(raw):
+                restarts += 1
+            continue
+        if _DAEMON_START_RE.search(raw):
+            daemons += 1
+
+    if len(empty) < 3 or known_after:
+        return None
+
+    times = [t for t, _ in empty if t]
+    span = f", {times[0]} ~ {times[-1]}" if len(times) >= 2 else ""
+    summary = (
+        f"RE 未找到 TSM4 controller (Controller 為空 x{len(empty)} 次檢查{span}), "
+        f"RE 未被 TSM4 管理, TSM4 的指令/設定無法送達"
+    )
+    evidence = [
+        f"RE 自己的 'Checking N if new Controller -- vs --' (controller id 全空): {len(empty)} 次{span}, 最後一次 N={empty[-1][1]}",
+        f"其中 'more than 10 ... restart new Controller' (RE 判定找不到 controller 而自行重啟 repacd): {restarts} 次",
+        f"期間 ezmesh/wsplcd 重新啟動: {daemons} 次",
+        "說明: 僅表示 RE 端沒有 controller; TSM4 為何沒回應需 TSM4 端確認 (正常的 RE 會是 -<TSM4 MAC>- vs -<TSM4 MAC>-)",
+        "來源: Console.log 的 [SERIAL] 'Checking N if new Controller' 行",
+    ]
+    return Finding("re_controller_missing", summary, evidence)
+
+
+RULES = [rule_re_controller_missing, rule_repacd_restart_loop, rule_wifi_connected_no_ip, rule_re_radar_bh_down, rule_bh_reconnect_loop]
 
 
 def analyze_lines(lines, stage="fail"):

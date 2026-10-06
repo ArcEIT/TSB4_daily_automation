@@ -18,6 +18,7 @@ MAP_END_MARKER = "__ARC_MAP_ONBOARDING_END__"
 IP_BEGIN_MARKER = "__ARC_IP_BEGIN__"
 IP_END_MARKER = "__ARC_IP_END__"
 
+
 _LAST_SSH_FAIL_LOG_TIME = 0
 
 
@@ -326,6 +327,165 @@ def final_onboarding_check(ser, interface_name):
 
     # 三維指標必須全部為 True 才判定最終過關
     return has_onboarding and has_ping and has_map_uci, has_onboarding, has_ping, has_map_uci, has_ip, state_value, map_uci_value
+
+
+_CHK_STATE_RE = re.compile(r"Onboarding\s*:\s*(\w+).*?repacd\.MAPConfig\.OnboardingDone:(\d+)")
+_CHK_CTRL_RE = re.compile(r"^\s*Controller::[ \t]*(\S*)[ \t]*$", re.MULTILINE)
+_CHK_ROLE_RE = re.compile(r"repacd-run\.sh map (NonCAP|CAP)\b")
+_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$")
+_CHK_STATUS_CMD = "chk_Status.sh"
+_CHK_STATUS_END = "chkLoop:"  # last line of chk_Status.sh output: "chkLoop:: 1, mld1:0, eth0:0, ..."
+
+
+def parse_chk_status(text):
+    """Parse chk_Status.sh output into {state, map_done, controller_id, role}.
+
+    Lines used (all printed by the RE itself):
+      Onboarding : done Uptime: ... repacd.MAPConfig.OnboardingDone:1
+      Controller::  BC:D5:ED:9A:97:62        (empty when the RE never found its MAP controller)
+      ... repacd-run.sh map NonCAP ...       (informational only: CAP = ETH uplink, NonCAP = WiFi uplink; it says
+                                              nothing about whether the controller was found)
+    The last match wins, so a repeated or echoed line cannot hide the real one."""
+    t = str(text or "").replace("\r", "")
+    info = {"state": "", "map_done": "", "controller_id": "", "role": ""}
+    for m in _CHK_STATE_RE.finditer(t):
+        info["state"], info["map_done"] = m.group(1).lower(), m.group(2)
+    for m in _CHK_CTRL_RE.finditer(t):
+        info["controller_id"] = m.group(1) if _MAC_RE.match(m.group(1)) else ""
+    for m in _CHK_ROLE_RE.finditer(t):
+        info["role"] = m.group(1)
+    return info
+
+
+def _run_chk_status(ser, timeout_sec=10):
+    """Type chk_Status.sh on the serial console and return the RE's own output.
+
+    Everything typed and printed goes through the serial logger, so the Console.log shows the command being
+    entered and the RE's full answer as [SERIAL] lines (device-side evidence, not text printed by the script)."""
+    with _SERIAL_IO_LOCK:
+        ser.reset_input_buffer()
+        ser.write((_CHK_STATUS_CMD + "\n").encode("utf-8"))
+        _, text = _receive_until_marker_or_timeout(ser, _CHK_STATUS_END, timeout_sec)
+    return text
+
+
+def _run_state_cmds(ser, timeout_sec=6):
+    """Type the onboarding-done commands on the serial console and return the RE's own output.
+
+    Same two commands the SSH polling runs (they are the pass criteria of the onboarding check):
+      cat /tmp/arc_onboarding_state
+      uci get repacd.MAPConfig.OnboardingDone
+    Typed on serial, so the Console.log shows the command being entered and the RE's answer as [SERIAL] lines."""
+    cmd = (
+        f"echo {STATE_BEGIN_MARKER}; cat /tmp/arc_onboarding_state 2>/dev/null; echo {STATE_END_MARKER}; "
+        f"echo {MAP_BEGIN_MARKER}; uci get repacd.MAPConfig.OnboardingDone 2>/dev/null; echo {MAP_END_MARKER}"
+    )
+    with _SERIAL_IO_LOCK:
+        ser.reset_input_buffer()
+        ser.write((cmd + "\n").encode("utf-8"))
+        _, text = _receive_until_marker_or_timeout(ser, MAP_END_MARKER, timeout_sec)
+    return text
+
+
+def check_onboarding_state_once(label):
+    """One-shot readiness snapshot, everything typed on the serial console.
+
+    1. cat /tmp/arc_onboarding_state + uci get repacd.MAPConfig.OnboardingDone  -> state done and MAP Done=1
+       (the same commands and markers as the SSH polling)
+    2. chk_Status.sh                                                            -> "Controller::<MAC>" and role
+    Returns dict: ok, state, map_done, controller ("known" | "unknown"), controller_id, role, source, reason.
+    ok = state done AND MAP OnboardingDone=1 AND the RE shows its controller
+    (the last one only when cfg.PRE_ACTION_REQUIRE_CONTROLLER is true).
+    The decision uses only what the RE printed, which appears as [SERIAL] lines in the Console.log.
+    Never raises; any error returns ok=False with the error in reason."""
+    ser = None
+    close_after_use = False
+    result = {"ok": False, "state": "", "map_done": "", "controller": "unknown", "controller_id": "", "role": "",
+              "source": "serial", "reason": ""}
+    try:
+        ser, close_after_use = get_serial_for_command()
+        with _SERIAL_IO_LOCK:
+            ser.reset_input_buffer()
+            ser.write(b"\r\n")
+        receive_monitor(0.5, ser)
+
+        state = map_done = ""
+        for _ in range(2):  # one immediate re-read when interleaved kernel messages garbled the output
+            text = _run_state_cmds(ser)
+            state = extract_onboarding_state_value(text).strip().lower()
+            map_done = extract_map_config_uci_value(text).strip()
+            if state:
+                break
+
+        info = {}
+        for _ in range(2):
+            info = parse_chk_status(_run_chk_status(ser))
+            if info["state"]:
+                break
+        if not state:  # fall back to what chk_Status.sh printed
+            state, map_done = info["state"], info["map_done"]
+
+        known = bool(info.get("controller_id"))
+        ok = state == "done" and map_done == "1"
+        if _cfg_bool("PRE_ACTION_REQUIRE_CONTROLLER", True) and not known:
+            ok = False
+        result.update(
+            ok=ok,
+            state=state,
+            map_done=map_done,
+            controller="known" if known else "unknown",
+            controller_id=info.get("controller_id", ""),
+            role=info.get("role", ""),
+        )
+        if not state:
+            result["reason"] = "onboarding state not parsed from the serial output"
+        log_progress(
+            f"[PRE-ACTION][{label}] serial {cfg.BOOSTER_PORT}: arc_onboarding_state={state or 'N/A'}, "
+            f"MAP OnboardingDone={map_done or 'N/A'}, Controller={info.get('controller_id') or '<empty>'}, "
+            f"role={info.get('role') or 'N/A'} -> {'READY' if ok else 'NOT READY'} "
+            f"(decided from the commands and RE output shown above as [SERIAL] lines)"
+        )
+    except Exception as e:
+        result["reason"] = f"{type(e).__name__}: {e}"
+        log_progress(f"[PRE-ACTION][{label}] serial check error: {result['reason']}")
+    finally:
+        if close_after_use and ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+    return result
+
+
+def wait_onboarding_done_with_retry(label, retries=None, sleep_s=None):
+    """Shared pre-action guard: onboarding state done, MAP OnboardingDone=1 and the RE knows its controller.
+
+    Checks once; if not ready, sleeps `sleep_s` and re-checks, up to `retries` extra times
+    (defaults: cfg.PRE_ACTION_RETRY_COUNT / cfg.PRE_ACTION_RETRY_SLEEP).
+    Returns (ok, detail); detail is a one-line description for Fail_Reason (no '|'), e.g.
+    "state=none, MAP Done=0, controller=unknown; checked 4 times over 180s"."""
+    retries = int(getattr(cfg, "PRE_ACTION_RETRY_COUNT", 3)) if retries is None else int(retries)
+    sleep_s = int(getattr(cfg, "PRE_ACTION_RETRY_SLEEP", 60)) if sleep_s is None else int(sleep_s)
+
+    snap = None
+    for attempt in range(retries + 1):
+        snap = check_onboarding_state_once(f"{label} {attempt + 1}/{retries + 1}")
+        if snap["ok"]:
+            break
+        if attempt < retries:
+            log_progress(
+                f"[PRE-ACTION][{label}] Booster 尚未 ready "
+                f"(state={snap['state'] or 'N/A'}, MAP Done={snap['map_done'] or 'N/A'}, controller={snap['controller']})，"
+                f"sleep {sleep_s}s 後重新確認 ({attempt + 1}/{retries})"
+            )
+            receive_monitor(sleep_s)
+
+    detail = f"state={snap['state'] or 'N/A'}, MAP Done={snap['map_done'] or 'N/A'}, controller={snap['controller']}"
+    if snap["reason"]:
+        detail += f", {snap['reason']}"
+    if not snap["ok"]:
+        detail += f"; checked {retries + 1} times over {retries * sleep_s}s"
+    return snap["ok"], detail
 
 
 def run_rd_poll_debug_dump(ser, interface_name, round_index, poll_status="UNKNOWN"):

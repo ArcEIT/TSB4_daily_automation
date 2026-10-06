@@ -104,6 +104,20 @@ RESET_ONBOARDING_THRESHOLD = 3
 
 PASS_COOLDOWN_TIME          = 60
 FINAL_ONBOARDING_CHECK_WAIT = 3
+
+# Pre-action check (case6~9, ETH BH stage only; the WiFi BH stage has its own pre-check): right before the TSM4 Reboot/Reset button is
+# pressed, the booster must report onboarding state "done" and repacd MAP OnboardingDone=1, otherwise
+# ezmesh/repacd may not be ready to receive the command. Not ready -> sleep and re-check; still not
+# ready after PRE_ACTION_RETRY_COUNT retries -> FAIL without pressing the button.
+PRE_ACTION_ONBOARDING_CHECK_ENABLE = True
+PRE_ACTION_RETRY_COUNT             = 3    # Re-checks after the first check (max extra wait = COUNT * SLEEP)
+PRE_ACTION_RETRY_SLEEP             = 60   # Sleep between checks (s)
+# The check is typed on the serial console, so the RE's own answers are visible as [SERIAL] lines in the Console.log:
+#   cat /tmp/arc_onboarding_state and uci get repacd.MAPConfig.OnboardingDone  (same commands as the SSH polling), and
+#   chk_Status.sh for "Controller::<MAC>".
+# Also require the RE to show its MAP controller (the TSM4 MAC after "Controller::"). An RE that rebooted keeps MAP Done=1
+# even when it never found the controller again (case12), so state done + MAP Done=1 alone is not enough.
+PRE_ACTION_REQUIRE_CONTROLLER      = True
 INIT_WAIT_TIME              = 120  # Generic init wait (s); most cases override this
 
 # Relay settle / BH restore
@@ -285,6 +299,17 @@ CASE10_AFTER_APPLY_WAIT = 5
 # SSH UCI check
 CASE10_SSH_UCI_TIMEOUT = 15
 
+# Sync check: after GUI apply the RE is polled every CASE10_SYNC_POLL_INTERVAL s until the new SSID/key appear
+# (max wait = CASE10_*_AFTER_GUI_APPLY_MONITOR_TIME). Live check = WiFi_inf_ChOnOff.sh "active" column shows the
+# new SSID on at least CASE10_LIVE_SSID_MIN_IFACES AP interfaces (2.4G + 5G). Mode: off | warn | fail.
+CASE10_SYNC_POLL_INTERVAL   = 10
+CASE10_LIVE_SSID_CHECK_MODE = "fail"
+CASE10_LIVE_SSID_MIN_IFACES = 2
+
+# GUI action retry: a sporadic GUI failure (page not rendered, session dropped) is retried instead of failing the case.
+CASE10_GUI_MAX_ATTEMPTS = 2
+CASE10_GUI_RETRY_WAIT   = 30
+
 # UCI commands – Case 10 Main WiFi VAP index validation
 CASE10_SSID_UCI_CMDS = [
     "uci get wireless.@wifi-iface[2].ssid",
@@ -338,6 +363,16 @@ CASE11_GUI_DISCARD_MODAL_WAIT = 1.5
 
 # SSH UCI check for Case11
 CASE11_SSH_UCI_TIMEOUT = 15
+
+# Sync check (same meaning as CASE10_*). Guest rows appear in WiFi_inf_ChOnOff.sh (net=lan1) when guest is enabled.
+CASE11_SYNC_POLL_INTERVAL   = 10
+CASE11_LIVE_SSID_CHECK_MODE = "fail"
+CASE11_LIVE_SSID_MIN_IFACES = 2
+
+# GUI action retry (same meaning as CASE10_GUI_*).
+CASE11_GUI_MAX_ATTEMPTS = 2
+CASE11_GUI_RETRY_WAIT   = 30
+
 CASE11_KEY_MATCH_MODE = "per_band_any"
 CASE11_KEY_UCI_GROUPS = [
     ["uci get wireless.@wifi-iface[7].sae_password", "uci get wireless.@wifi-iface[7].key"],
@@ -373,9 +408,15 @@ XPATH_GUEST_WIFI_DISCARD_YES   = "/html/body/ngb-modal-window/div/div/app-modal-
 # =============================================================================
 CASE12_ETH_BH_INIT_WAIT     = 10
 CASE12_WIFI_BH_INIT_WAIT    = 240
-CASE12_WIRELESS_SYNC_WAIT   = 60
+# Max wait for the RE to show the Disable/Enable result (polled every 15s, stops at the first pass). On 2026-10-02
+# (TSM4 FW 1.0.514) the RE was still in "wifi_sync on" with the radio off (disd=1) after 60s, before it came back as FH_*.
+CASE12_WIRELESS_SYNC_WAIT   = 180
 CASE12_ENABLE_RECOVERY_WAIT = 60
 CASE12_FINAL_ENABLE_WAIT    = 10
+
+# GUI screenshots: only when a GUI action fails (the result is judged from WiFi_inf_ChOnOff.sh, which is logged every
+# round). True = also save the 2 screenshots per GUI action on PASS (about 10 images per run).
+CASE12_SAVE_SCREENSHOTS_ALWAYS = False
 
 CASE12_GUI_MAX_ATTEMPTS     = 2
 CASE12_GUI_RETRY_WAIT       = 30

@@ -16,6 +16,7 @@ SSH fallback:
   In that case, pcap deletion falls back to raspi5 serial port (COM5).
 """
 import os
+import re
 import time
 
 import serial
@@ -26,6 +27,7 @@ from .logger import log_progress
 _bssid      = None
 _bssid_safe = None
 _active     = False
+_keep_remote_pcap = False   # set when the pcap download failed: do not delete it on raspi5
 
 _SCAN_SCRIPT    = "/home/AirCapture/Auto_Scan_BSSID_DumpPackets_AllCH.sh"
 _SCAN_LOG       = "/tmp/bh_beacon_monitor.log"
@@ -113,65 +115,30 @@ def _sftp_get(remote, local):
 # Public API
 # ---------------------------------------------------------------------------
 
-def start(bssid, duration):
-    """Start background beacon scan on raspi5.
+def _serial_run(cmd, wait=3.0):
+    """Run one shell command on raspi5 through its serial console (COM5).
 
-    Args:
-        bssid:    TSM4 BH BSSID (e.g. "3E:D5:ED:9A:97:67")
-        duration: max scan time in seconds (should cover precheck_max_limit)
-    """
-    global _bssid, _bssid_safe, _active
-    _bssid      = None
-    _bssid_safe = None
-    _active     = False
-
-    scan_script = getattr(cfg, "RASPI5_BH_BEACON_SCAN_SCRIPT", _SCAN_SCRIPT)
-
-    # Kill any leftover
-    _ssh(
-        f"[ -f {_PID_FILE} ] && kill $(cat {_PID_FILE}) 2>/dev/null; "
-        f"pkill -f 'Auto_Scan_BSSID_DumpPackets' 2>/dev/null; "
-        f"pkill -f 'tcpdump.*wlan0mon' 2>/dev/null; "
-        f"rm -f {_PID_FILE} {_SCAN_LOG}",
-        timeout=10,
-    )
-
-    cmd = (
-        f"nohup timeout {duration} {scan_script} --bssid {bssid} "
-        f"> {_SCAN_LOG} 2>&1 & echo $! > {_PID_FILE}"
-    )
-    log_progress(f"[BH_MONITOR] Start: bssid={bssid}, duration={duration}s, log={_SCAN_LOG}")
-    ok, out = _ssh_retry(cmd, timeout=15)
-    if not ok:
-        log_progress(f"[BH_MONITOR] Start FAIL: {out}")
-        return
-
-    _bssid      = bssid
-    _bssid_safe = bssid.lower().replace(":", "-")   # tshark outputs lowercase MAC → pcap filename is lowercase
-    _active     = True
-    log_progress(f"[BH_MONITOR] Scan running in background on raspi5")
-
-
-def _serial_rm_pcap():
-    """Fallback: delete pcap via raspi5 serial port (COM5) when SSH is unreachable."""
-    if not _bssid_safe:
-        return
+    Used when SSH is unreachable (raspi5 sits behind the TSM4 LAN, which is down while the
+    TSM4 reboots). Assumes the console is already logged in. Returns (ok, output)."""
     port = getattr(cfg, "RASPI5_SERIAL_PORT", _RASPI5_SERIAL_PORT)
     baud = getattr(cfg, "RASPI5_BAUD_RATE",   _RASPI5_BAUD_RATE)
-    cmd  = f"rm -f {_PCAP_DIR}/capture_{_bssid_safe}_*.pcap\r\n"
-    log_progress(f"[BH_MONITOR] SSH unavailable – fallback to serial {port} for pcap cleanup")
     ser = None
     try:
         ser = serial.Serial(port, baud, timeout=1)
         ser.write(b"\r\n")
-        time.sleep(1)
-        ser.read(ser.in_waiting)       # flush prompt
-        ser.write(cmd.encode())
-        time.sleep(2)
-        out = ser.read(ser.in_waiting).decode("utf-8", errors="ignore")
-        log_progress(f"[BH_MONITOR] Serial rm result: {out.strip()!r}")
+        time.sleep(0.5)
+        ser.reset_input_buffer()
+        ser.write((cmd + "\r\n").encode("utf-8"))
+        chunks = []
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            n = ser.in_waiting
+            if n:
+                chunks.append(ser.read(n))
+            time.sleep(0.2)
+        return True, b"".join(chunks).decode("utf-8", errors="ignore")
     except Exception as exc:
-        log_progress(f"[BH_MONITOR] Serial fallback FAIL: {type(exc).__name__}: {exc}")
+        return False, f"{type(exc).__name__}: {exc}"
     finally:
         if ser and ser.is_open:
             try:
@@ -180,20 +147,80 @@ def _serial_rm_pcap():
                 pass
 
 
-def _kill_and_cleanup():
-    """Kill scan process and delete pcap files. Falls back to serial if SSH fails."""
-    pcap_rm = f"rm -f {_PCAP_DIR}/capture_{_bssid_safe}_*.pcap 2>/dev/null" if _bssid_safe else "true"
-    ok, _ = _ssh(
+def _run(cmd, ssh_timeout=20, serial_wait=3.0):
+    """Run a command on raspi5: SSH first (2 attempts), then the COM5 serial console.
+
+    Returns (ok, output, via) with via in ("ssh", "serial", "")."""
+    for attempt in (1, 2):
+        ok, out = _ssh(cmd, timeout=ssh_timeout)
+        if ok:
+            return True, out, "ssh"
+        if attempt == 1:
+            time.sleep(2)
+    log_progress(f"[BH_MONITOR] SSH to raspi5 unreachable ({out.strip()}) – fallback to serial console")
+    ok, out = _serial_run(cmd, wait=serial_wait)
+    if ok:
+        log_progress(f"[BH_MONITOR] Serial command sent, output: {out.strip()[-200:]!r}")
+        return True, out, "serial"
+    log_progress(f"[BH_MONITOR] Serial fallback FAIL: {out}")
+    return False, out, ""
+
+
+def _stop_cmd(sig=""):
+    # '[A]uto' / '[w]lan0mon': the bracket keeps pkill -f from matching (and killing) the
+    # remote shell that carries this very command line.
+    return (
         f"[ -f {_PID_FILE} ] && kill $(cat {_PID_FILE}) 2>/dev/null; "
-        f"pkill -f 'Auto_Scan_BSSID_DumpPackets' 2>/dev/null; "
-        f"pkill -9 -f 'tcpdump.*wlan0mon' 2>/dev/null; "
-        f"rm -f {_PID_FILE}; sleep 2; "
-        f"{pcap_rm}",
-        timeout=20,
+        f"pkill -f '[A]uto_Scan_BSSID_DumpPackets' 2>/dev/null; "
+        f"pkill {sig} -f 'tcpdump.*[w]lan0mon' 2>/dev/null; "
     )
+
+
+def start(bssid, duration):
+    """Start background beacon scan on raspi5.
+
+    Args:
+        bssid:    TSM4 BH BSSID (e.g. "3E:D5:ED:9A:97:67")
+        duration: max scan time in seconds (should cover precheck_max_limit)
+    """
+    global _bssid, _bssid_safe, _active, _keep_remote_pcap
+    _bssid      = None
+    _bssid_safe = None
+    _active     = False
+    _keep_remote_pcap = False
+
+    scan_script = getattr(cfg, "RASPI5_BH_BEACON_SCAN_SCRIPT", _SCAN_SCRIPT)
+
+    # Kill any leftover (a separate command: the start command line below contains the script
+    # name, which a pkill -f in the same shell would match)
+    _run(_stop_cmd() + f"rm -f {_PID_FILE} {_SCAN_LOG}", ssh_timeout=10, serial_wait=3)
+
+    cmd = (
+        f"nohup timeout {duration} {scan_script} --bssid {bssid} "
+        f"> {_SCAN_LOG} 2>&1 & echo $! > {_PID_FILE}"
+    )
+    log_progress(f"[BH_MONITOR] Start: bssid={bssid}, duration={duration}s, log={_SCAN_LOG}")
+    ok, out, via = _run(cmd, ssh_timeout=15, serial_wait=4)
     if not ok:
-        # SSH unreachable (GW just rebooted, LAN down) – use serial fallback
-        _serial_rm_pcap()
+        log_progress(f"[BH_MONITOR] Start FAIL: {out}")
+        return
+
+    _bssid      = bssid
+    _bssid_safe = bssid.lower().replace(":", "-")   # tshark outputs lowercase MAC → pcap filename is lowercase
+    _active     = True
+    log_progress(f"[BH_MONITOR] Scan running in background on raspi5 (started via {via})")
+
+
+def _kill_and_cleanup():
+    """Kill scan process and delete pcap files (SSH, falling back to the COM5 serial console)."""
+    if _keep_remote_pcap:
+        pcap_rm = "true"
+        log_progress(f"[BH_MONITOR] pcap download failed earlier – keep {_PCAP_DIR}/capture_{_bssid_safe}_*.pcap on raspi5 for manual retrieval")
+    elif _bssid_safe:
+        pcap_rm = f"rm -f {_PCAP_DIR}/capture_{_bssid_safe}_*.pcap 2>/dev/null"
+    else:
+        pcap_rm = "true"
+    _run(_stop_cmd("-9") + f"rm -f {_PID_FILE}; sleep 2; {pcap_rm}", ssh_timeout=20, serial_wait=6)
 
 
 def stop_and_cleanup():
@@ -203,7 +230,7 @@ def stop_and_cleanup():
         return
     log_progress("[BH_MONITOR] PASS: stop + cleanup")
     _kill_and_cleanup()
-    _ssh(f"rm -f {_SCAN_LOG}", timeout=10)
+    _run(f"rm -f {_SCAN_LOG}", ssh_timeout=10, serial_wait=2)
     _active = False
 
 
@@ -220,6 +247,16 @@ def stop_and_check():
     log_progress("[BH_MONITOR] FAIL: stop + check log")
     ok, log_text = _ssh(f"cat {_SCAN_LOG} 2>/dev/null || echo ''", timeout=10)
     found = ok and _FOUND_MARKER in log_text
+    if not ok:
+        # SSH unreachable: ask the raspi5 serial console for a one-letter verdict instead of the whole log.
+        # ('BH_$(...)' keeps the echoed command line from matching the BH_Y / BH_N result.)
+        s_ok, s_out = _serial_run(
+            f"echo BH_$(grep -q '{_FOUND_MARKER}' {_SCAN_LOG} 2>/dev/null && echo Y || echo N)", wait=3
+        )
+        m = re.search(r"BH_([YN])\b", s_out) if s_ok else None
+        found = bool(m and m.group(1) == "Y")
+        log_text = s_out if s_ok else ""
+        log_progress(f"[BH_MONITOR] scan log read via serial: {'found' if found else 'not found / unknown'}")
 
     _kill_and_cleanup()
     _active = False
@@ -232,32 +269,53 @@ def stop_and_check():
     return found, log_text
 
 
-def fetch_pcap(local_dir):
-    """FAIL path: download air pcap from raspi5 before _kill_and_cleanup deletes it.
+def fetch_pcap(local_dir, tag=""):
+    """FAIL path: stop the capture, then download the air pcap from raspi5.
 
-    Must be called BEFORE stop_and_check() because _kill_and_cleanup() (called inside
-    stop_and_check) deletes the pcap from raspi5.
+    Call BEFORE stop_and_check(): its cleanup deletes the pcap from raspi5. If the download
+    fails the pcap is kept on raspi5 (the cleanup skips it) so it can be fetched by hand.
+    The local file is named '<tag>_<remote name>' so the ZIP shows which case it belongs to.
+
+    Returns the local path, or None when no pcap could be saved.
     """
+    global _keep_remote_pcap
     if not _active or not _bssid_safe:
         log_progress("[BH_MONITOR] fetch_pcap: not active or no bssid – skip")
-        return
-    ok, out = _ssh(
+        return None
+
+    # Stop the writers first so the pcap is flushed and no longer growing while it is copied.
+    _run(_stop_cmd() + "sleep 3", ssh_timeout=20, serial_wait=5)
+
+    ok, out = _ssh_retry(
         f"ls -t {_PCAP_DIR}/capture_{_bssid_safe}_*.pcap 2>/dev/null | head -1",
         timeout=10,
     )
-    if not ok or not out.strip():
-        log_progress("[BH_MONITOR] fetch_pcap: no pcap found on raspi5")
-        return
+    if not ok:
+        _keep_remote_pcap = True
+        log_progress("[BH_MONITOR] fetch_pcap: raspi5 unreachable – pcap (if any) is kept on raspi5")
+        return None
     remote_path = out.strip()
+    if not remote_path:
+        log_progress("[BH_MONITOR] fetch_pcap: no pcap found on raspi5 (scan never locked the BSSID)")
+        return None
+
     filename = os.path.basename(remote_path)
     os.makedirs(local_dir, exist_ok=True)
-    local_path = os.path.join(local_dir, filename)
+    local_path = os.path.join(local_dir, f"{tag}_{filename}" if tag else filename)
     log_progress(f"[BH_MONITOR] Fetching air pcap: {remote_path} → {local_path}")
-    ok2, reason = _sftp_get(remote_path, local_path)
-    if ok2:
-        log_progress(f"[BH_MONITOR] Air pcap saved → {local_path}")
-    else:
-        log_progress(f"[BH_MONITOR] Air pcap fetch FAIL: {reason}")
+
+    reason = ""
+    for attempt in range(1, _SSH_RETRIES + 1):
+        ok2, reason = _sftp_get(remote_path, local_path)
+        if ok2 and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            log_progress(f"[BH_MONITOR] Air pcap saved → {local_path} ({os.path.getsize(local_path)} bytes)")
+            return local_path
+        log_progress(f"[BH_MONITOR] Air pcap download attempt {attempt}/{_SSH_RETRIES} failed: {reason}")
+        time.sleep(_SSH_RETRY_INT)
+
+    _keep_remote_pcap = True
+    log_progress(f"[BH_MONITOR] Air pcap fetch FAIL – kept on raspi5: {remote_path}")
+    return None
 
 
 def fetch_log(local_path):
