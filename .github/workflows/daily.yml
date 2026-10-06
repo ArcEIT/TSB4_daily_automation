@@ -24,7 +24,7 @@ jobs:
         
       - name: 2-2. 等待 TSM4 就緒
         if: always()
-        run: Start-Sleep -Seconds 300
+        run: Start-Sleep -Seconds 500
         
       - name: 3. 執行測試 Case1, Case2
         continue-on-error: true
