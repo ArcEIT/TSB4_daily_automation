@@ -20,6 +20,7 @@ jobs:
       - name: 2-1. Final TSM4 GUI Factory Default
         if: always()
         run: python tsm4_gui_factory_default_standalone.py
+      - name: 2.2. 等待 TSM4 就緒
         run: Start-Sleep -Seconds 300
         
       - name: 3. 執行測試 Case1, Case2
