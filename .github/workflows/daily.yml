@@ -17,6 +17,11 @@ jobs:
         continue-on-error: true
         run: python run_all_cases_like_github.py --only initial_wait,fw_upgrade
 
+      - name: 2-1. Final TSM4 GUI Factory Default
+        if: always()
+        run: python tsm4_gui_factory_default_standalone.py
+        run: Start-Sleep -Seconds 300
+        
       - name: 3. 執行測試 Case1, Case2
         continue-on-error: true
         run: python run_all_cases_like_github.py --only case1,case2
