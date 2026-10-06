@@ -362,7 +362,13 @@ def main():
 
     screenshot_files = sorted(glob.glob("*.png"))
 
-    log_result(f"Final collect: found Summary={len(summary_files)}, Console={len(console_files)}, diagnostic={len(diagnostic_files)}, tsm4_gui_log={len(tsm4_gui_files)}, screenshot={len(screenshot_files)}")
+    # raspi5 air captures / BH beacon scan logs downloaded by the cases on FAIL.
+    air_capture_files = sorted(set(
+        glob.glob("*.pcap") +
+        glob.glob("*_bh_beacon.log")
+    ))
+
+    log_result(f"Final collect: found Summary={len(summary_files)}, Console={len(console_files)}, diagnostic={len(diagnostic_files)}, tsm4_gui_log={len(tsm4_gui_files)}, screenshot={len(screenshot_files)}, air_capture={len(air_capture_files)}")
 
     # ---- Crash scan ----
     log_step("Final collect: scan Console logs for Kernel panic / Fatal exception")
@@ -511,7 +517,7 @@ def main():
     log_result(f"Final collect: crash summary written to {crash_summary_file}")
 
     log_step(f"Final collect: create ZIP report {zip_name}")
-    files_to_zip = [all_summary_name, crash_summary_file] + summary_files + console_files + diagnostic_files + tsm4_gui_files + screenshot_files
+    files_to_zip = [all_summary_name, crash_summary_file] + summary_files + console_files + diagnostic_files + tsm4_gui_files + screenshot_files + air_capture_files
 
     with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
         for log_f in files_to_zip:
@@ -547,6 +553,7 @@ def main():
     diag_highlight = "\n".join(f"  - {os.path.basename(f)}" for f in diagnostic_files) if diagnostic_files else "None"
     tsm4_gui_highlight = "\n".join(f"  - {os.path.basename(f)}" for f in tsm4_gui_files) if tsm4_gui_files else "None"
     screenshot_highlight = "\n".join(f"  - {os.path.basename(f)}" for f in screenshot_files) if screenshot_files else "None"
+    air_capture_highlight = "\n".join(f"  - {os.path.basename(f)}" for f in air_capture_files) if air_capture_files else "None"
     sftp_uploaded_text = "\n".join(f"  - {p}" for p in uploaded_paths) if uploaded_paths else "None"
 
     subject = f"[{status}] TSB4 Automation Test Report - {fw_version} - {now_str}"
@@ -571,6 +578,9 @@ Please download the ZIP report from the following SFTP path:
 
 [ TSM4 GUI Logs Included in ZIP ]
 {tsm4_gui_highlight}
+
+[ raspi5 Air Capture / BH Beacon Logs Included in ZIP ]
+{air_capture_highlight}
 """
 
     email_attachments = [] if sftp_ok else [all_summary_name]
@@ -578,7 +588,7 @@ Please download the ZIP report from the following SFTP path:
 
     log_step("Final collect: cleanup original Summary/Console/diagnostic files")
     # 只清理工作目錄下的原始個別檔案；保留 target_folder 內的 all_summary 與 zip。
-    for f in summary_files + console_files + diagnostic_files + tsm4_gui_files + screenshot_files:
+    for f in summary_files + console_files + diagnostic_files + tsm4_gui_files + screenshot_files + air_capture_files:
         try:
             os.remove(f)
         except Exception:
