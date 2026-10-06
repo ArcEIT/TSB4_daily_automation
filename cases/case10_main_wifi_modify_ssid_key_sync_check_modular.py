@@ -4,14 +4,15 @@
 Case10 - Main WiFi SSID/key modify and RE UCI sync check.
 
 New modular architecture, legacy flow:
-  ETH BH relay on  -> GUI modify -> fixed monitor wait -> SSH UCI check
-  WiFi BH relay off -> GUI modify -> fixed monitor wait -> SSH UCI check
+  ETH BH relay on  -> onboarding check -> GUI modify -> poll RE until synced (SSH UCI + live SSID)
+  WiFi BH relay off -> onboarding check -> GUI modify -> poll RE until synced (SSH UCI + live SSID)
 
 Important:
   - No four-dimensional onboarding polling.
   - Generic knobs are read from testlib.config.
   - Serial is used for full-session console logging and SSH host discovery only.
-  - UCI value check is done by SSH in one bundled command.
+  - Sync check polls the RE over SSH (testlib.wifi_sync_check): UCI values + live SSID, stops at first match.
+  - Before the GUI change, the RE must be onboarding done (state done + MAP Done=1), retry per PRE_ACTION_*.
 """
 
 import argparse
@@ -48,16 +49,13 @@ from testlib.serial_console import (
     stop_background_serial_logger,
     get_serial_for_command,
 )
-from testlib.ssh_client import run_ssh_command, discover_ssh_host_by_serial
+from testlib.ssh_client import discover_ssh_host_by_serial
 from testlib.recovery import safe_handle_fail_recovery
 from testlib.web_gui import save_gui_screenshot
-from testlib.dut_health import wait_for_onboarding_if_recently_rebooted, monitored_wait
+from testlib.dut_health import wait_for_onboarding_if_recently_rebooted
+from testlib import wifi_sync_check, gui_failure
+from testlib.onboarding import wait_onboarding_done_with_retry
 from cases._case_common import add_common_args, apply_common_args
-
-
-UCI_BEGIN_MARKER = "__ARC_CASE10_UCI_BEGIN__"
-UCI_END_MARKER = "__ARC_CASE10_UCI_END__"
-UCI_ITEM_PREFIX = "__ARC_CASE10_UCI_ITEM__"
 
 
 def _cfg(name, default):
@@ -93,64 +91,6 @@ def generate_wifi_profile(prefix):
     return ssid, key
 
 
-def _shell_sq(text):
-    """Single-quote text for POSIX shell."""
-    return "'" + str(text).replace("'", "'\"'\"'") + "'"
-
-
-def _all_case10_uci_entries():
-    entries = []
-    for cmd in _cfg("CASE10_SSID_UCI_CMDS", []):
-        entries.append(("SSID", cmd))
-    for cmd in _cfg("CASE10_KEY_UCI_CMDS", []):
-        entries.append(("KEY", cmd))
-    return entries
-
-
-def build_case10_uci_bundle_cmd():
-    """Build one SSH command that reads all Case10 UCI values."""
-    parts = [f"echo {UCI_BEGIN_MARKER}"]
-
-    for item_type, cmd in _all_case10_uci_entries():
-        label = f"{item_type}|{cmd}"
-        parts.append(
-            "printf " + _shell_sq(f"{UCI_ITEM_PREFIX}|{label}|")
-            + "; " + f"{cmd} 2>/dev/null || true"
-            + "; echo"
-        )
-
-    parts.append(f"echo {UCI_END_MARKER}")
-    return "; ".join(parts)
-
-
-def parse_uci_bundle_output(output):
-    """Return {(item_type, cmd): value} parsed from the SSH bundle output."""
-    result = {}
-    collecting = False
-
-    for raw_line in (output or "").replace("\r", "").split("\n"):
-        line = raw_line.strip()
-
-        if line == UCI_BEGIN_MARKER:
-            collecting = True
-            continue
-
-        if line == UCI_END_MARKER:
-            break
-
-        if not collecting or not line.startswith(UCI_ITEM_PREFIX + "|"):
-            continue
-
-        parts = line.split("|", 3)
-        if len(parts) != 4:
-            continue
-
-        _, item_type, cmd, value = parts
-        result[(item_type, cmd)] = value.strip()
-
-    return result
-
-
 def discover_case10_ssh_host():
     """Use config host first; otherwise discover RE br-lan IP via serial."""
     host = _cfg("ONBOARDING_SSH_HOST", None)
@@ -174,84 +114,32 @@ def discover_case10_ssh_host():
                 pass
 
 
-def _validate_ssid_values(values, expected_ssid):
-    failures = []
-    for cmd in _cfg("CASE10_SSID_UCI_CMDS", []):
-        actual = values.get(("SSID", cmd), "")
-        log_progress(f"[CASE10][CHECK][SSID] {cmd} => {actual or '<empty>'}")
-        if actual != expected_ssid:
-            failures.append(f"{cmd}: expected='{expected_ssid}', actual='{actual or '<empty>'}'")
-    return failures
+def _sync_spec():
+    return wifi_sync_check.SyncSpec(
+        tag="CASE10",
+        title="Main WiFi",
+        ssid_cmds=list(_cfg("CASE10_SSID_UCI_CMDS", [])),
+        key_cmds=list(_cfg("CASE10_KEY_UCI_CMDS", [])),
+        key_groups=_cfg("CASE10_KEY_UCI_GROUPS", None),
+        key_mode=str(_cfg("CASE10_KEY_MATCH_MODE", "per_band_any")).lower(),
+        ssh_timeout=int(_cfg("CASE10_SSH_UCI_TIMEOUT", 15)),
+        live_net="lan",
+        live_mode=str(_cfg("CASE10_LIVE_SSID_CHECK_MODE", "fail")).lower(),
+        live_min=int(_cfg("CASE10_LIVE_SSID_MIN_IFACES", 2)),
+    )
 
 
-def _default_key_groups():
-    cmds = list(_cfg("CASE10_KEY_UCI_CMDS", []))
-    if len(cmds) >= 4:
-        return [cmds[:2], cmds[2:4]]
-    return [[cmd] for cmd in cmds]
-
-
-def _validate_key_values(values, expected_key):
-    """Validate key UCI values.
-
-    Default mode is per_band_any:
-      - CASE10_KEY_UCI_CMDS[0:2] are treated as 2.4G key candidates.
-      - CASE10_KEY_UCI_CMDS[2:4] are treated as 5G key candidates.
-      - At least one key candidate per band must match expected_key.
-
-    Set CASE10_KEY_MATCH_MODE="all" in config.py if every key command must match.
-    """
-    failures = []
-    mode = str(_cfg("CASE10_KEY_MATCH_MODE", "per_band_any")).lower()
-    key_cmds = list(_cfg("CASE10_KEY_UCI_CMDS", []))
-
-    for cmd in key_cmds:
-        actual = values.get(("KEY", cmd), "")
-        match_text = "<match>" if actual == expected_key else "<mismatch/empty>"
-        log_progress(f"[CASE10][CHECK][KEY] {cmd} => {match_text}")
-
-    if mode == "all":
-        for cmd in key_cmds:
-            actual = values.get(("KEY", cmd), "")
-            if actual != expected_key:
-                failures.append(f"{cmd}: expected='<hidden>', actual='<hidden or empty>'")
-        return failures
-
-    groups = _cfg("CASE10_KEY_UCI_GROUPS", None) or _default_key_groups()
-    for idx, group in enumerate(groups, start=1):
-        if not group:
-            continue
-        if not any(values.get(("KEY", cmd), "") == expected_key for cmd in group):
-            failures.append(f"KEY group {idx}: no matching key UCI among {group}")
-
-    return failures
-
-
-def check_re_wifi_sync(expected_ssid, expected_key):
-    """Check RE Main WiFi UCI values via SSH after GUI apply monitor wait."""
-    host = discover_case10_ssh_host()
-    if not host:
-        return False, "RE SSH host discover failed"
-
-    log_step(f"Case10: check RE Main WiFi UCI sync via SSH ({host})")
-    timeout = int(_cfg("CASE10_SSH_UCI_TIMEOUT", 15))
-    ok, output, reason = run_ssh_command(host, build_case10_uci_bundle_cmd(), timeout=timeout)
-    if not ok:
-        return False, f"SSH UCI check failed: {reason}"
-
-    values = parse_uci_bundle_output(output)
-    failures = []
-    failures.extend(_validate_ssid_values(values, expected_ssid))
-    failures.extend(_validate_key_values(values, expected_key))
-
-    if failures:
-        log_result("Case10: RE Main WiFi UCI sync FAIL")
-        for failure in failures:
-            log_progress(f"[CASE10][CHECK][FAIL] {failure}")
-        return False, "; ".join(failures)
-
-    log_result("Case10: RE Main WiFi UCI sync PASS")
-    return True, "None"
+def check_re_wifi_sync(expected_ssid, expected_key, interface_name, timeout):
+    """Poll the RE over SSH until the new main WiFi SSID/key are synced (UCI + live SSID) or timeout."""
+    return wifi_sync_check.poll_until_synced(
+        _sync_spec(),
+        discover_case10_ssh_host,
+        expected_ssid,
+        expected_key,
+        timeout,
+        int(_cfg("CASE10_SYNC_POLL_INTERVAL", 10)),
+        interface_name,
+    )
 
 
 def wait_loading_done(wait, timeout_note="loadingModal"):
@@ -295,21 +183,25 @@ def is_logged_in(driver):
 def modify_wifi_by_gui(ssid, wifi_password):
     log_step(f"Web GUI action: modify main WiFi SSID to {ssid}")
     driver = None
+    step = "init"
 
     try:
         from testlib import env_info as env
 
+        step = "create Chrome"
         driver = env.create_chrome_driver()
         if driver is None:
             return False, "Chrome create failed"
 
         wait = WebDriverWait(driver, cfg.WAIT_TIMEOUT)
 
+        step = "open Web GUI"
         log_progress("開啟 Web GUI 頁面...")
         driver.get(cfg.GATEWAY_URL)
         receive_monitor(float(_cfg("CASE10_GUI_OPEN_WAIT", 2)))
 
         if not is_logged_in(driver):
+            step = "login"
             log_progress("Web GUI 填入帳密執行認證...")
             user_input = wait.until(EC.element_to_be_clickable((By.XPATH, cfg.XPATH_LOGIN_USER)))
             user_input.clear()
@@ -325,16 +217,19 @@ def modify_wifi_by_gui(ssid, wifi_password):
             wait_loading_done(wait)
             receive_monitor(float(_cfg("CASE10_GUI_AFTER_LOGIN_WAIT", 2)))
 
+        step = "navigate to WiFi Settings"
         log_progress("導航至 WiFi Settings 基礎配置頁面...")
         wifi_link = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_WIFI_SETTINGS)))
         js_click(driver, wifi_link)
         receive_monitor(float(_cfg("CASE10_GUI_WIFI_PAGE_WAIT", 10)))
 
         ssid_input = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_MAIN_WIFI_SSID_INPUT)))
+        step = "set main SSID"
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", ssid_input)
         receive_monitor(float(_cfg("CASE10_GUI_FIELD_SCROLL_WAIT", 0.5)))
         js_set_input_value(driver, ssid_input, ssid)
 
+        step = "set main key"
         key_input = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_MAIN_WIFI_KEY_INPUT)))
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", key_input)
         receive_monitor(float(_cfg("CASE10_GUI_FIELD_SCROLL_WAIT", 0.5)))
@@ -342,6 +237,7 @@ def modify_wifi_by_gui(ssid, wifi_password):
 
         receive_monitor(float(_cfg("CASE10_GUI_BEFORE_APPLY_WAIT", 1.5)))
 
+        step = "click Apply"
         log_progress("點擊 Apply 執行設定變更...")
         apply_btn = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_WIFI_BASIC_APPLY)))
         js_click(driver, apply_btn)
@@ -354,8 +250,10 @@ def modify_wifi_by_gui(ssid, wifi_password):
         return True, "None"
 
     except Exception as e:
-        reason = f"Web GUI action FAIL: {type(e).__name__}: {e}"
+        reason = gui_failure.describe_gui_exception(e, step, cfg.WAIT_TIMEOUT)
         log_result(reason)
+        log_progress(f"[GUI_FAIL] raw exception: {type(e).__name__}: {str(e)[:300]!r}")
+        save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_gui_fail_{step}")
         return False, reason
 
     finally:
@@ -380,15 +278,27 @@ def run_one_stage(loop_str, interface_name, ssid, key, monitor_time):
             log_progress(f"WiFi BH pre-GUI wait {pre_gui_wait}s：等待 RE 建立 WiFi BH 並取得 DHCP 後再變更 SSID")
             receive_monitor(pre_gui_wait)
 
-    gui_ok, gui_reason = modify_wifi_by_gui(ssid, key)
+    # Pre-GUI check: the RE must be onboarded (state done + MAP OnboardingDone=1) before the TSM4 setting is
+    # changed. An RE that is not registered with the TSM4 controller can never receive the sync, so the later
+    # UCI check would fail for a reason unrelated to the sync itself.
+    if _cfg("PRE_ACTION_ONBOARDING_CHECK_ENABLE", False):
+        log_progress(f"Case10 {interface_name}: 修改 WiFi 前，先確認 RE onboarding state = done 且 MAP Done = 1...")
+        ready, detail = wait_onboarding_done_with_retry(f"Case10 {interface_name} Pre-GUI")
+        if not ready:
+            log_result(f"Case10 {interface_name}: RE 尚未 onboarding done ({detail})，未修改 WiFi 設定")
+            return False, f"RE not onboarding done before modifying main WiFi ({detail}) - WiFi setting not changed"
+
+    gui_ok, gui_reason = gui_failure.run_with_retry(
+        lambda: modify_wifi_by_gui(ssid, key),
+        _cfg("CASE10_GUI_MAX_ATTEMPTS", 2),
+        _cfg("CASE10_GUI_RETRY_WAIT", 30),
+        f"Case10 {interface_name} GUI",
+    )
     if not gui_ok:
         return False, gui_reason
 
-    log_progress(f"GUI apply 完成，monitored_wait {monitor_time}s 等待 RE UCI 同步")
-    if not monitored_wait(monitor_time, f"Case10 {interface_name} GUI apply sync", check_interval=30):
-        return False, f"DUT_Unexpected_Reboot_During_{interface_name.replace(' ', '_')}_Monitor_Wait"
-
-    return check_re_wifi_sync(ssid, key)
+    log_progress(f"GUI apply 完成，輪詢 RE UCI/live SSID 同步 (最多 {monitor_time}s)")
+    return check_re_wifi_sync(ssid, key, interface_name, monitor_time)
 
 
 def run_test():

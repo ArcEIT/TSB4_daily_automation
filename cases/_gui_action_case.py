@@ -18,7 +18,7 @@ from testlib.env_info import get_router_fw_version, get_booster_fw_version
 from testlib.web_gui import trigger_web_action
 from testlib.relay import control_relay, restore_eth_backhaul
 from testlib.serial_console import receive_monitor
-from testlib.onboarding import run_polling_or_recover, poll_booster_console
+from testlib.onboarding import run_polling_or_recover, poll_booster_console, wait_onboarding_done_with_retry
 from testlib.ssh_client import get_cached_ssh_host, run_ssh_command
 from testlib.recovery import safe_handle_fail_recovery
 from testlib import bh_beacon_monitor
@@ -172,15 +172,27 @@ def execute_one_backhaul_test(
                 _pcap_local_dir = os.path.dirname(
                     os.path.abspath(getattr(cfg, "FULL_CONSOLE_LOG", "") or ".")
                 ) or "."
-                bh_beacon_monitor.fetch_pcap(_pcap_local_dir)
+                # File names carry the case id so several failed cases do not overwrite each other
+                # and the collect script can package them (*.pcap, *_bh_beacon.log).
+                _file_tag = f"{cfg.CASE_ID}_Loop{loop}_{interface_name.replace(' ', '_')}_PreCheck"
+                _scan_started = bh_beacon_monitor.is_active()
+                _pcap_path = bh_beacon_monitor.fetch_pcap(_pcap_local_dir, _file_tag)
                 beacon_found, _ = bh_beacon_monitor.stop_and_check()
-                _log_dir = os.path.dirname(os.path.abspath(getattr(cfg, "FULL_CONSOLE_LOG", "") or "."))
-                _log_name = f"Loop{loop}_{interface_name.replace(' ', '_')}_PreCheck_bh_beacon.log"
-                bh_beacon_monitor.fetch_log(os.path.join(_log_dir, _log_name))
-                if beacon_found:
-                    fail_reason += f" | raspi5: TSM4 BH BSSID ({bh_beacon_bssid}) detected (GW OK, Booster issue)"
+                if _scan_started:
+                    _log_dir = os.path.dirname(os.path.abspath(getattr(cfg, "FULL_CONSOLE_LOG", "") or "."))
+                    bh_beacon_monitor.fetch_log(os.path.join(_log_dir, f"{_file_tag}_bh_beacon.log"))
+                if not _scan_started:
+                    # Never say "NOT detected" when raspi5 never scanned (SSH and COM5 both failed at start).
+                    fail_reason += f" | raspi5: BH beacon scan 未啟動 (raspi5 無法連線), 無法判斷 TSM4 BH BSSID ({bh_beacon_bssid}) 是否有廣播, 無 air pcap"
                 else:
-                    fail_reason += f" | raspi5: TSM4 BH BSSID ({bh_beacon_bssid}) NOT detected (GW BH not broadcasting)"
+                    if beacon_found:
+                        fail_reason += f" | raspi5: TSM4 BH BSSID ({bh_beacon_bssid}) detected (GW OK, Booster issue)"
+                    else:
+                        fail_reason += f" | raspi5: TSM4 BH BSSID ({bh_beacon_bssid}) NOT detected (GW BH not broadcasting)"
+                    fail_reason += (
+                        f" | air pcap: {os.path.basename(_pcap_path)}" if _pcap_path
+                        else " | air pcap: 未取得 (若 raspi5 仍可連線, 檔案保留在 /home/AirCapture)"
+                    )
 
             write_summary(summary_loop_display(str(loop), interface_name), interface_name, "N/A", "FAIL", fail_reason)
             log_result(f"Loop {loop} {interface_name}: FAIL, Booster 未能透過 {backhaul_name} 連線，跳過 reboot 測試")
@@ -202,6 +214,34 @@ def execute_one_backhaul_test(
         log_progress(f"STEP: Relay 切換 ({relay_state.upper()}) 配置 {interface_name}")
         control_relay(relay_state)
         receive_monitor(cfg.RELAY_SETTLE_TIME)
+
+    # Pre-action check (ETH BH stage, every loop): the booster must report onboarding state "done"
+    # and MAP OnboardingDone=1 right before the TSM4 button is pressed. If ezmesh/repacd is not ready the
+    # command can be lost and the later FAIL ("command not received") is misleading.
+    # The WiFi BH stage is skipped: its pre-check (pre_connect_check) already requires state done + MAP Done=1
+    # + ping GW held through the cooldown and a Final Check.
+    if not pre_connect_check and getattr(cfg, "PRE_ACTION_ONBOARDING_CHECK_ENABLE", False):
+        log_step(f"Loop {loop} {interface_name}: pre-action onboarding check before '{action_label}'")
+        log_progress(f"STEP: 送出 {action_label} 前，確認 Booster onboarding state = done 且 MAP Done = 1...")
+        _pre_ok, _why = wait_onboarding_done_with_retry(f"Loop {loop} {interface_name} Pre-Action")
+        if not _pre_ok:
+            write_summary(
+                summary_loop_display(str(loop), interface_name), interface_name, "N/A", "FAIL",
+                f"Booster not onboarding done before TSM4 '{action_label}' ({_why}) - command not sent",
+            )
+            log_result(f"Loop {loop} {interface_name}: FAIL, Booster 仍未 onboarding done ({_why})，未送出 '{action_label}'")
+            log_progress(f"!! {interface_name} Pre-Action check FAIL，未按 {action_label}，停止測試 !!")
+            if active_driver is not None:
+                try:
+                    active_driver.quit()
+                except Exception:
+                    pass
+            safe_handle_fail_recovery(
+                f"Loop{loop}_{interface_name.replace(' ', '_')}_PreAction_Fail",
+                restore_eth_bh=restore_eth_bh,
+            )
+            return False
+        log_result(f"Loop {loop} {interface_name}: Pre-Action check PASS (state=done, MAP Done=1, controller known)，開始送出 '{action_label}'")
 
     log_step(f"Loop {loop} {interface_name}: GUI action start ({action_label})")
     log_progress(f"STEP: 準備執行 {interface_name} 測試 (GUI 觸發 {action_label})")

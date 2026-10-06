@@ -42,6 +42,7 @@ from testlib.env_info import create_chrome_driver, get_environment_fw_versions_c
 from testlib.relay import control_relay, restore_eth_backhaul, restore_eth_backhaul_between_loops
 from testlib.recovery import safe_handle_fail_recovery
 from testlib.dut_health import wait_for_onboarding_if_recently_rebooted, monitored_wait
+from testlib.onboarding import wait_onboarding_done_with_retry
 from testlib.serial_console import (
     receive_monitor,
     start_background_serial_logger,
@@ -343,17 +344,48 @@ def parse_wifi_inf_chonoff_rows(output: str) -> dict:
     return rows
 
 
+def judge_lan_ap_row(idx: str, row: dict, expected_enabled: bool) -> Tuple[bool, str, str]:
+    """Judge one LAN AP row of WiFi_inf_ChOnOff.sh. Returns (ok, fail_text, matched_mode).
+
+    Wireless Disable must show on the RE as an FH rename: ssid starts with 'FH' (FH_<n>_<random>), still
+    transmitting (disd=0, hidden). A radio that is switched off instead (disd=1, active empty, ssid unchanged) is NOT
+    accepted: it was seen on 2026-10-02 (TSM4 FW 1.0.514) while a manual Disable on the same FW gave the FH rename, so
+    it is reported as its own failure text.
+    Wireless Enable must show the real SSID again: ssid not starting with 'FH', disd=0, active == ssid."""
+    ssid = row.get("ssid", "")
+    active = row.get("active", "")
+    disd = row.get("disd", "")
+
+    if expected_enabled:
+        problems = []
+        if ssid.startswith("FH"):
+            problems.append(f"ssid={ssid}(期望非FH開頭/real SSID)")
+        if disd != "0":
+            problems.append(f"disd={disd or '<empty>'}(期望0)")
+        if active != ssid:
+            problems.append(f"active={active or '<empty>'}(期望={ssid or '<empty>'})")
+        if problems:
+            return False, f"idx{idx} " + ", ".join(problems), ""
+        return True, "", "real SSID active"
+
+    if ssid.startswith("FH"):
+        return True, "", "FH rename"
+    if disd == "1" and not active:
+        return False, f"idx{idx} 無線被直接關閉(disd=1, active空)但 ssid={ssid or '<empty>'} 未改成 FH 開頭", ""
+    return False, f"idx{idx} ssid={ssid or '<empty>'}(期望FH開頭), disd={disd or '<empty>'}, active={active or '<empty>'}", ""
+
+
 def check_wifi_inf_lan_ap_active_state(host: str, expected_enabled: bool, label: str) -> Tuple[bool, str]:
     """Check idx 2/5 LAN AP active state from WiFi_inf_ChOnOff.sh.
 
     expected_enabled=True:
-      idx 2 and 5 active must equal ssid and disd must be 0.
+      idx 2 and 5: ssid not FH-prefixed, disd=0 and active == ssid.
     expected_enabled=False:
-      idx 2 and 5 active must be empty and disd must be 1.
+      idx 2 and 5: ssid starts with 'FH' (FH rename). See judge_lan_ap_row().
     """
     if not bool(getattr(cfg, "CASE12_WIFI_INF_CHECK_ENABLE", True)):
         log_progress(f"[CASE12][WiFi_inf] check disabled by CASE12_WIFI_INF_CHECK_ENABLE=False")
-        return True
+        return True, ""
 
     command = getattr(cfg, "CASE12_WIFI_INF_CHONOFF_CMD", "WiFi_inf_ChOnOff.sh")
     target_indexes = [str(x) for x in getattr(cfg, "CASE12_WIFI_INF_TARGET_INDEXES", ["2", "5"])]
@@ -386,14 +418,11 @@ def check_wifi_inf_lan_ap_active_state(host: str, expected_enabled: bool, label:
             f"active={active or '<empty>'}, disd={disd}, raw={raw}"
         )
 
-        if expected_enabled:
-            # Enabled: real SSID, should NOT start with "FH"
-            if ssid.startswith("FH"):
-                failures.append(f"idx{idx} ssid={ssid}(期望非FH開頭/real SSID)")
+        row_ok, row_fail, mode = judge_lan_ap_row(idx, row, expected_enabled)
+        if row_ok:
+            log_progress(f"[CASE12][WiFi_inf] idx={idx} OK: {mode}")
         else:
-            # Disabled: SSID changes to FH_xxx random, should start with "FH"
-            if not ssid.startswith("FH"):
-                failures.append(f"idx{idx} ssid={ssid or '<empty>'}(期望FH開頭)")
+            failures.append(row_fail)
 
     if failures:
         for item in failures:
@@ -450,9 +479,12 @@ def click_apply_if_available(driver, wait, action_label=""):
         wait_loading_done(wait)
         receive_monitor(2)
         safe = action_label.replace(" ", "_") if action_label else "apply"
-        save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_{safe}_after_apply")
+        if bool(getattr(cfg, "CASE12_SAVE_SCREENSHOTS_ALWAYS", False)):
+            save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_{safe}_after_apply")
     except Exception as e:
         log_progress(f"Apply button 未出現或不可點擊，繼續流程: {type(e).__name__}: {e}")
+        safe = action_label.replace(" ", "_") if action_label else "apply"
+        save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_{safe}_apply_problem")
 
 
 def set_tsm4_wireless(driver, wait, desired_enabled: bool, booster_host: str, action_label: str = "") -> bool:
@@ -483,8 +515,10 @@ def set_tsm4_wireless(driver, wait, desired_enabled: bool, booster_host: str, ac
     new_state = read_gui_toggle_state(driver, toggle_after)
     receive_monitor(2)
     safe_label = action_label.replace(" ", "_") if action_label else "toggle"
-    save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_{safe_label}_toggle_after_click")
-    if new_state is not None and new_state != desired_enabled:
+    toggle_failed = new_state is not None and new_state != desired_enabled
+    if toggle_failed or bool(getattr(cfg, "CASE12_SAVE_SCREENSHOTS_ALWAYS", False)):
+        save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_{safe_label}_toggle_after_click")
+    if toggle_failed:
         log_progress(f"[CASE12][GUI] toggle 點擊後狀態仍為 {'enabled' if new_state else 'disabled'}，未切換成功，回傳 False")
         return False
 
@@ -532,6 +566,7 @@ def set_tsm4_wireless_with_retry(host: str, desired_enabled: bool, action_label:
 
         except Exception as e:
             log_progress(f"[CASE12][GUI] {action_label} 發生異常 (attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}")
+            save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_{action_label.replace(' ', '_')}_gui_exception")
             if attempt < max_attempts:
                 log_progress(f"[CASE12][GUI] 等待 {retry_wait} 秒後 retry: {action_label}")
                 receive_monitor(retry_wait)
@@ -592,6 +627,50 @@ def enable_wireless_then_fail_no_reboot(host: str, stage_name: str, reason: str)
     return no_reboot_fail_out(stage_name, reason)
 
 
+def collect_disable_sync_diag(host: str, label: str) -> None:
+    """Collect wsplcd / LED / WiFi_inf snapshot to diagnose FH disable sync issues.
+
+    Called twice per disable cycle:
+      1. Right after TSM4 Wireless Disable GUI succeeds (baseline: has wsplcd received the command?)
+      2. After _poll_fh_sync() timeout (delta: did wsplcd process it during the wait window?)
+
+    Evidence collected:
+      - logread | grep wsplcd (last 30 lines) : shows if wsplcd received / processed disable event
+      - cat /tmp/wsplcd-lan.conf              : shows the active wsplcd config SSID / BSS state
+      - cat /tmp/last_led.led                 : shows LED state (wifi_sync on = sync in progress)
+      - WiFi_inf_ChOnOff.sh (disd/active)     : snapshot of FH interface state at this moment
+    """
+    log_separator(f"[CASE12][SYNC DIAG] {label}")
+
+    # 1. wsplcd recent log
+    ok, out, _ = run_ssh_command(host, "logread | grep -i wsplcd | tail -30",
+                                 timeout=int(getattr(cfg, "ONBOARDING_SSH_TIMEOUT", 10)))
+    if not ok:
+        ok, out, _ = serial_get_output("logread | grep -i wsplcd | tail -30", read_time=5)
+    log_progress(f"[CASE12][SYNC DIAG] wsplcd logread:\n{out or '<empty>'}")
+
+    # 2. wsplcd-lan.conf SSID / BSS settings
+    ok2, out2, _ = run_ssh_command(host, "grep -E 'ssid|disabled|enable|bss' /tmp/wsplcd-lan.conf 2>/dev/null | head -30",
+                                   timeout=int(getattr(cfg, "ONBOARDING_SSH_TIMEOUT", 10)))
+    if not ok2:
+        ok2, out2, _ = serial_get_output("grep -E 'ssid|disabled|enable|bss' /tmp/wsplcd-lan.conf 2>/dev/null | head -30", read_time=5)
+    log_progress(f"[CASE12][SYNC DIAG] wsplcd-lan.conf (ssid/bss):\n{out2 or '<empty>'}")
+
+    # 3. LED state (/tmp/last_led.led)
+    ok3, out3, _ = run_ssh_command(host, "cat /tmp/last_led.led 2>/dev/null",
+                                   timeout=int(getattr(cfg, "ONBOARDING_SSH_TIMEOUT", 10)))
+    if not ok3:
+        ok3, out3, _ = serial_get_output("cat /tmp/last_led.led 2>/dev/null", read_time=3)
+    log_progress(f"[CASE12][SYNC DIAG] last_led.led: {out3 or '<empty>'}")
+
+    # 4. WiFi_inf_ChOnOff.sh snapshot (full output)
+    cmd_inf = getattr(cfg, "CASE12_WIFI_INF_CHONOFF_CMD", "WiFi_inf_ChOnOff.sh")
+    ok4, out4, _ = run_ssh_command(host, cmd_inf, timeout=int(getattr(cfg, "ONBOARDING_SSH_TIMEOUT", 10)))
+    if not ok4:
+        ok4, out4, _ = serial_get_output(cmd_inf, read_time=5)
+    log_progress(f"[CASE12][SYNC DIAG] WiFi_inf_ChOnOff.sh:\n{out4 or '<empty>'}")
+
+
 def run_wireless_disable_enable_stage(stage_name: str, init_wait: int, relay_state: str, host: str) -> Tuple[bool, str, str]:
     """Returns (ok, status_label, fail_detail).
 
@@ -607,16 +686,53 @@ def run_wireless_disable_enable_stage(stage_name: str, init_wait: int, relay_sta
         fd = f"{stage_name}: DUT 在 init wait 期間發生未預期 reboot"
         return False, f"{stage_name} Unexpected Reboot", fd
 
+    # Pre-check: the RE must be onboarded and know its TSM4 controller before Wireless is disabled. A just-rebooted RE
+    # (uptime only a little over the 300s guard) can still be restarting repacd/ezmesh with no controller, and then the
+    # FH change can never sync, which is not what this case tests.
+    if bool(getattr(cfg, "PRE_ACTION_ONBOARDING_CHECK_ENABLE", False)):
+        log_progress(f"{stage_name}: Disable Wireless 前，先確認 RE onboarding done、MAP Done=1 且已找到 TSM4 controller...")
+        ready, detail = wait_onboarding_done_with_retry(f"Case12 {stage_name} Pre-Disable")
+        if not ready:
+            log_result(f"Case12 {stage_name}: RE 尚未 ready ({detail})，未按 Disable Wireless")
+            return False, f"{stage_name} Pre-check", f"RE not ready before Disable Wireless ({detail}) - Wireless not changed"
+
+    # Starting state: Wireless must be Enabled on the RE before it is disabled. A previous failed run (or a manual test)
+    # can leave it disabled; the Disable step would then "pass" at 0s without any transition being tested.
+    pre_ok, _ = check_wifi_inf_lan_ap_active_state(host, True, label=f"{stage_name} starting-state check")
+    if pre_ok:
+        log_progress(f"[CASE12] {stage_name}: 起始狀態 Wireless 已是 Enable (real SSID active)，開始測試")
+    else:
+        log_progress(f"[CASE12] {stage_name}: 起始狀態不是 Enable (可能前一次測試/手動操作留下)，先 Enable Wireless 並等 RE 同步")
+        if not set_tsm4_wireless_with_retry(host, desired_enabled=True, action_label=f"{stage_name} Starting-state Enable Wireless"):
+            fd = f"{stage_name}: Wireless was not enabled before Disable and the GUI Enable failed - Disable step not run"
+            log_result(f"Case12 {stage_name} FAIL: {fd}")
+            return False, f"{stage_name} Starting state", fd
+        start_ok, start_detail = _poll_fh_sync(
+            host, f"{stage_name} Starting-state Enable", "0", True, cfg.CASE12_WIRELESS_SYNC_WAIT
+        )
+        if not start_ok:
+            fd = (f"{stage_name}: Wireless was not enabled before Disable and could not be restored "
+                  f"({start_detail}) - Disable step not run")
+            log_result(f"Case12 {stage_name} FAIL: {fd}")
+            return False, f"{stage_name} Starting state", fd.replace("|", "/")
+        log_result(f"Case12 {stage_name}: starting state restored to Enable")
+
     log_separator(f"{stage_name} - STEP 1: TSM4 GUI Disable Wireless")
     if not set_tsm4_wireless_with_retry(host, desired_enabled=False, action_label=f"{stage_name} Disable Wireless"):
         log_progress(f"{stage_name} GUI Disable Wireless 失敗")
         fd = f"{stage_name}: GUI Disable Wireless 失敗，已嘗試 enable wireless recovery。"
         enable_wireless_then_fail_no_reboot(host, stage_name, fd)
         return False, f"{stage_name} Disable", fd
+    # Collect wsplcd/LED/WiFi_inf snapshot right after TSM4 Wireless Disable GUI sent.
+    # This captures whether wsplcd received the disable event before the sync wait begins.
+    collect_disable_sync_diag(host, f"{stage_name} Disable — snapshot after GUI sent (pre-poll)")
+
     sync_dis_ok, dis_fail_detail = _poll_fh_sync(
         host, f"{stage_name} Disable", "1", False, cfg.CASE12_WIRELESS_SYNC_WAIT
     )
     if not sync_dis_ok:
+        # Collect again after timeout to compare wsplcd state delta vs pre-poll snapshot.
+        collect_disable_sync_diag(host, f"{stage_name} Disable — snapshot after sync timeout (post-poll)")
         if "WiFi BH" in stage_name:
             bridge_note = _check_wifi_bh_bridge_note(host)
             if bridge_note:

@@ -4,14 +4,16 @@
 Case11 - Guest WiFi SSID/key modify and RE UCI sync check.
 
 New modular architecture, legacy flow:
-  ETH BH relay on  -> GUI modify -> fixed monitor wait -> SSH UCI check
-  WiFi BH relay off -> GUI modify -> fixed monitor wait -> SSH UCI check
+  ETH BH relay on  -> onboarding check -> GUI modify -> poll RE until synced (SSH UCI + live SSID)
+  WiFi BH relay off -> onboarding check -> GUI modify -> poll RE until synced (SSH UCI + live SSID)
 
 Important:
   - No four-dimensional onboarding polling.
   - Generic knobs are read from testlib.config.
   - Serial is used for full-session console logging and SSH host discovery only.
-  - UCI value check is done by SSH in one bundled command.
+  - Sync check polls the RE over SSH (testlib.wifi_sync_check): UCI values + live SSID, stops at first match.
+  - Before the GUI change, the RE must be onboarding done (state done + MAP Done=1), retry per PRE_ACTION_*.
+  - At the end (PASS, FAIL or interrupt) the Guest WiFi is disabled again (CASE11_CLEANUP_DISABLE_GUEST_WIFI).
 """
 
 import argparse
@@ -48,16 +50,13 @@ from testlib.serial_console import (
     stop_background_serial_logger,
     get_serial_for_command,
 )
-from testlib.ssh_client import run_ssh_command, discover_ssh_host_by_serial
+from testlib.ssh_client import discover_ssh_host_by_serial
 from testlib.recovery import safe_handle_fail_recovery
 from testlib.web_gui import save_gui_screenshot
-from testlib.dut_health import wait_for_onboarding_if_recently_rebooted, monitored_wait
+from testlib.dut_health import wait_for_onboarding_if_recently_rebooted
+from testlib import wifi_sync_check, gui_failure
+from testlib.onboarding import wait_onboarding_done_with_retry
 from cases._case_common import add_common_args, apply_common_args
-
-
-UCI_BEGIN_MARKER = "__ARC_CASE11_UCI_BEGIN__"
-UCI_END_MARKER = "__ARC_CASE11_UCI_END__"
-UCI_ITEM_PREFIX = "__ARC_CASE11_UCI_ITEM__"
 
 
 def _cfg(name, default):
@@ -93,64 +92,6 @@ def generate_wifi_profile(prefix):
     return ssid, key
 
 
-def _shell_sq(text):
-    """Single-quote text for POSIX shell."""
-    return "'" + str(text).replace("'", "'\"'\"'") + "'"
-
-
-def _all_case11_uci_entries():
-    entries = []
-    for cmd in _cfg("CASE11_GUEST_SSID_UCI_CMDS", []):
-        entries.append(("SSID", cmd))
-    for cmd in _cfg("CASE11_GUEST_KEY_UCI_CMDS", []):
-        entries.append(("KEY", cmd))
-    return entries
-
-
-def build_case11_uci_bundle_cmd():
-    """Build one SSH command that reads all Case11 UCI values."""
-    parts = [f"echo {UCI_BEGIN_MARKER}"]
-
-    for item_type, cmd in _all_case11_uci_entries():
-        label = f"{item_type}|{cmd}"
-        parts.append(
-            "printf " + _shell_sq(f"{UCI_ITEM_PREFIX}|{label}|")
-            + "; " + f"{cmd} 2>/dev/null || true"
-            + "; echo"
-        )
-
-    parts.append(f"echo {UCI_END_MARKER}")
-    return "; ".join(parts)
-
-
-def parse_uci_bundle_output(output):
-    """Return {(item_type, cmd): value} parsed from the SSH bundle output."""
-    result = {}
-    collecting = False
-
-    for raw_line in (output or "").replace("\r", "").split("\n"):
-        line = raw_line.strip()
-
-        if line == UCI_BEGIN_MARKER:
-            collecting = True
-            continue
-
-        if line == UCI_END_MARKER:
-            break
-
-        if not collecting or not line.startswith(UCI_ITEM_PREFIX + "|"):
-            continue
-
-        parts = line.split("|", 3)
-        if len(parts) != 4:
-            continue
-
-        _, item_type, cmd, value = parts
-        result[(item_type, cmd)] = value.strip()
-
-    return result
-
-
 def discover_case11_ssh_host():
     """Use config host first; otherwise discover RE br-lan IP via serial."""
     host = _cfg("ONBOARDING_SSH_HOST", None)
@@ -174,84 +115,32 @@ def discover_case11_ssh_host():
                 pass
 
 
-def _validate_ssid_values(values, expected_ssid):
-    failures = []
-    for cmd in _cfg("CASE11_GUEST_SSID_UCI_CMDS", []):
-        actual = values.get(("SSID", cmd), "")
-        log_progress(f"[CASE11][CHECK][SSID] {cmd} => {actual or '<empty>'}")
-        if actual != expected_ssid:
-            failures.append(f"{cmd}: expected='{expected_ssid}', actual='{actual or '<empty>'}'")
-    return failures
+def _sync_spec():
+    return wifi_sync_check.SyncSpec(
+        tag="CASE11",
+        title="Guest WiFi",
+        ssid_cmds=list(_cfg("CASE11_GUEST_SSID_UCI_CMDS", [])),
+        key_cmds=list(_cfg("CASE11_GUEST_KEY_UCI_CMDS", [])),
+        key_groups=_cfg("CASE11_KEY_UCI_GROUPS", None),
+        key_mode=str(_cfg("CASE11_KEY_MATCH_MODE", "per_band_any")).lower(),
+        ssh_timeout=int(_cfg("CASE11_SSH_UCI_TIMEOUT", 15)),
+        live_net="lan1",
+        live_mode=str(_cfg("CASE11_LIVE_SSID_CHECK_MODE", "fail")).lower(),
+        live_min=int(_cfg("CASE11_LIVE_SSID_MIN_IFACES", 2)),
+    )
 
 
-def _default_key_groups():
-    cmds = list(_cfg("CASE11_GUEST_KEY_UCI_CMDS", []))
-    if len(cmds) >= 4:
-        return [cmds[:2], cmds[2:4]]
-    return [[cmd] for cmd in cmds]
-
-
-def _validate_key_values(values, expected_key):
-    """Validate key UCI values.
-
-    Default mode is per_band_any:
-      - CASE11_GUEST_KEY_UCI_CMDS[0:2] are treated as 2.4G key candidates.
-      - CASE11_GUEST_KEY_UCI_CMDS[2:4] are treated as 5G key candidates.
-      - At least one key candidate per band must match expected_key.
-
-    Set CASE11_KEY_MATCH_MODE="all" in config.py if every key command must match.
-    """
-    failures = []
-    mode = str(_cfg("CASE11_KEY_MATCH_MODE", "per_band_any")).lower()
-    key_cmds = list(_cfg("CASE11_GUEST_KEY_UCI_CMDS", []))
-
-    for cmd in key_cmds:
-        actual = values.get(("KEY", cmd), "")
-        match_text = "<match>" if actual == expected_key else "<mismatch/empty>"
-        log_progress(f"[CASE11][CHECK][KEY] {cmd} => {match_text}")
-
-    if mode == "all":
-        for cmd in key_cmds:
-            actual = values.get(("KEY", cmd), "")
-            if actual != expected_key:
-                failures.append(f"{cmd}: expected='<hidden>', actual='<hidden or empty>'")
-        return failures
-
-    groups = _cfg("CASE11_KEY_UCI_GROUPS", None) or _default_key_groups()
-    for idx, group in enumerate(groups, start=1):
-        if not group:
-            continue
-        if not any(values.get(("KEY", cmd), "") == expected_key for cmd in group):
-            failures.append(f"KEY group {idx}: no matching key UCI among {group}")
-
-    return failures
-
-
-def check_re_wifi_sync(expected_ssid, expected_key):
-    """Check RE Guest WiFi UCI values via SSH after GUI apply monitor wait."""
-    host = discover_case11_ssh_host()
-    if not host:
-        return False, "RE SSH host discover failed"
-
-    log_step(f"Case11: check RE Guest WiFi UCI sync via SSH ({host})")
-    timeout = int(_cfg("CASE11_SSH_UCI_TIMEOUT", 15))
-    ok, output, reason = run_ssh_command(host, build_case11_uci_bundle_cmd(), timeout=timeout)
-    if not ok:
-        return False, f"SSH UCI check failed: {reason}"
-
-    values = parse_uci_bundle_output(output)
-    failures = []
-    failures.extend(_validate_ssid_values(values, expected_ssid))
-    failures.extend(_validate_key_values(values, expected_key))
-
-    if failures:
-        log_result("Case11: RE Guest WiFi UCI sync FAIL")
-        for failure in failures:
-            log_progress(f"[CASE11][CHECK][FAIL] {failure}")
-        return False, "; ".join(failures)
-
-    log_result("Case11: RE Guest WiFi UCI sync PASS")
-    return True, "None"
+def check_re_wifi_sync(expected_ssid, expected_key, interface_name, timeout):
+    """Poll the RE over SSH until the new guest WiFi SSID/key are synced (UCI + live SSID) or timeout."""
+    return wifi_sync_check.poll_until_synced(
+        _sync_spec(),
+        discover_case11_ssh_host,
+        expected_ssid,
+        expected_key,
+        timeout,
+        int(_cfg("CASE11_SYNC_POLL_INTERVAL", 10)),
+        interface_name,
+    )
 
 
 def wait_loading_done(wait, timeout_note="loadingModal"):
@@ -349,11 +238,11 @@ def get_guest_wifi_toggle_text(driver, toggle):
 
 
 def set_guest_wifi_enabled(driver, wait, enable=True):
-    """Ensure Guest WiFi enable toggle is in the requested state."""
+    """Ensure Guest WiFi enable toggle is in the requested state. Returns True when the toggle was clicked."""
     xpath = getattr(cfg, "XPATH_GUEST_WIFI_ENABLE_TOGGLE", "")
     if not xpath:
         log_progress("Case11: XPATH_GUEST_WIFI_ENABLE_TOGGLE 未設定，略過 Guest Enable 檢查")
-        return True
+        return False
 
     desired_text = "On" if enable else "Off"
     opposite_text = "Off" if enable else "On"
@@ -367,30 +256,34 @@ def set_guest_wifi_enabled(driver, wait, enable=True):
         js_click(driver, toggle)
         receive_monitor(float(_cfg("CASE11_GUI_TOGGLE_WAIT", 2)))
         save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_guest_wifi_toggle_after_click")
-    else:
-        log_progress(f"Guest WiFi 看起來已是 {desired_text} 或無法判讀狀態，略過 toggle")
+        return True
 
-    return True
+    log_progress(f"Guest WiFi 看起來已是 {desired_text} 或無法判讀狀態，略過 toggle")
+    return False
 
 
 def modify_wifi_by_gui(ssid, wifi_password):
     log_step(f"Web GUI action: modify guest WiFi SSID to {ssid}")
     driver = None
+    step = "init"
 
     try:
         from testlib import env_info as env
 
+        step = "create Chrome"
         driver = env.create_chrome_driver()
         if driver is None:
             return False, "Chrome create failed"
 
         wait = WebDriverWait(driver, cfg.WAIT_TIMEOUT)
 
+        step = "open Web GUI"
         log_progress("開啟 Web GUI 頁面...")
         driver.get(cfg.GATEWAY_URL)
         receive_monitor(float(_cfg("CASE11_GUI_OPEN_WAIT", 2)))
 
         if not is_logged_in(driver):
+            step = "login"
             log_progress("Web GUI 填入帳密執行認證...")
             user_input = wait.until(EC.element_to_be_clickable((By.XPATH, cfg.XPATH_LOGIN_USER)))
             user_input.clear()
@@ -406,11 +299,13 @@ def modify_wifi_by_gui(ssid, wifi_password):
             wait_loading_done(wait)
             receive_monitor(float(_cfg("CASE11_GUI_AFTER_LOGIN_WAIT", 2)))
 
+        step = "navigate to WiFi Settings"
         log_progress("導航至 WiFi Settings 頁面...")
         wifi_link = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_WIFI_SETTINGS)))
         js_click(driver, wifi_link)
         receive_monitor(float(_cfg("CASE11_GUI_WIFI_PAGE_WAIT", 10)))
 
+        step = "open Guest WiFi tab"
         log_progress("切換至 Guest WiFi 頁籤...")
         guest_tab = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_GUEST_WIFI_TAB)))
         js_click(driver, guest_tab)
@@ -420,6 +315,7 @@ def modify_wifi_by_gui(ssid, wifi_password):
         handle_discard_changes_modal(driver, note="after clicking Guest tab")
         receive_monitor(float(_cfg("CASE11_GUI_GUEST_PAGE_WAIT", 5)))
 
+        step = "wait Guest SSID input"
         try:
             ssid_input = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_GUEST_WIFI_SSID_INPUT)))
         except Exception:
@@ -430,12 +326,15 @@ def modify_wifi_by_gui(ssid, wifi_password):
             handle_discard_changes_modal(driver, note="after retry clicking Guest tab")
             ssid_input = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_GUEST_WIFI_SSID_INPUT)))
 
+        step = "enable Guest WiFi toggle"
         set_guest_wifi_enabled(driver, wait, enable=True)
 
+        step = "set Guest SSID"
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", ssid_input)
         receive_monitor(float(_cfg("CASE11_GUI_FIELD_SCROLL_WAIT", 0.5)))
         js_set_input_value(driver, ssid_input, ssid)
 
+        step = "set Guest key"
         key_input = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_GUEST_WIFI_KEY_INPUT)))
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", key_input)
         receive_monitor(float(_cfg("CASE11_GUI_FIELD_SCROLL_WAIT", 0.5)))
@@ -443,6 +342,7 @@ def modify_wifi_by_gui(ssid, wifi_password):
 
         receive_monitor(float(_cfg("CASE11_GUI_BEFORE_APPLY_WAIT", 1.5)))
 
+        step = "click Apply"
         log_progress("點擊 Apply 執行設定變更...")
         apply_btn = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_GUEST_WIFI_APPLY_BTN)))
         js_click(driver, apply_btn)
@@ -455,8 +355,10 @@ def modify_wifi_by_gui(ssid, wifi_password):
         return True, "None"
 
     except Exception as e:
-        reason = f"Web GUI action FAIL: {type(e).__name__}: {e}"
+        reason = gui_failure.describe_gui_exception(e, step, cfg.WAIT_TIMEOUT)
         log_result(reason)
+        log_progress(f"[GUI_FAIL] raw exception: {type(e).__name__}: {str(e)[:300]!r}")
+        save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_gui_fail_{step}")
         return False, reason
 
     finally:
@@ -481,18 +383,139 @@ def run_one_stage(loop_str, interface_name, ssid, key, monitor_time):
             log_progress(f"WiFi BH pre-GUI wait {pre_gui_wait}s：等待 RE 建立 WiFi BH 並取得 DHCP 後再變更 SSID")
             receive_monitor(pre_gui_wait)
 
-    gui_ok, gui_reason = modify_wifi_by_gui(ssid, key)
+    # Pre-GUI check: the RE must be onboarded (state done + MAP OnboardingDone=1) before the TSM4 setting is
+    # changed. An RE that is not registered with the TSM4 controller can never receive the sync, so the later
+    # UCI check would fail for a reason unrelated to the sync itself.
+    if _cfg("PRE_ACTION_ONBOARDING_CHECK_ENABLE", False):
+        log_progress(f"Case11 {interface_name}: 修改 WiFi 前，先確認 RE onboarding state = done 且 MAP Done = 1...")
+        ready, detail = wait_onboarding_done_with_retry(f"Case11 {interface_name} Pre-GUI")
+        if not ready:
+            log_result(f"Case11 {interface_name}: RE 尚未 onboarding done ({detail})，未修改 WiFi 設定")
+            return False, f"RE not onboarding done before modifying guest WiFi ({detail}) - WiFi setting not changed"
+
+    gui_ok, gui_reason = gui_failure.run_with_retry(
+        lambda: modify_wifi_by_gui(ssid, key),
+        _cfg("CASE11_GUI_MAX_ATTEMPTS", 2),
+        _cfg("CASE11_GUI_RETRY_WAIT", 30),
+        f"Case11 {interface_name} GUI",
+    )
     if not gui_ok:
         return False, gui_reason
 
-    log_progress(f"GUI apply 完成，monitored_wait {monitor_time}s 等待 RE UCI 同步")
-    if not monitored_wait(monitor_time, f"Case11 {interface_name} GUI apply sync", check_interval=30):
-        return False, f"DUT_Unexpected_Reboot_During_{interface_name.replace(' ', '_')}_Monitor_Wait"
+    log_progress(f"GUI apply 完成，輪詢 RE UCI/live SSID 同步 (最多 {monitor_time}s)")
+    return check_re_wifi_sync(ssid, key, interface_name, monitor_time)
 
-    return check_re_wifi_sync(ssid, key)
+
+def disable_guest_wifi_by_gui():
+    """Cleanup: leave the TSM4 Guest WiFi disabled. Returns (ok, reason). Never raises.
+
+    Case11 turns Guest on and changes its SSID/key; without this the Guest stays on for whatever runs next."""
+    log_step("Case11 cleanup: disable TSM4 Guest WiFi")
+    driver = None
+    step = "init"
+    try:
+        from testlib import env_info as env
+
+        step = "create Chrome"
+        driver = env.create_chrome_driver()
+        if driver is None:
+            return False, "Chrome create failed"
+        wait = WebDriverWait(driver, cfg.WAIT_TIMEOUT)
+
+        step = "open Web GUI"
+        driver.get(cfg.GATEWAY_URL)
+        receive_monitor(float(_cfg("CASE11_GUI_OPEN_WAIT", 2)))
+
+        if not is_logged_in(driver):
+            step = "login"
+            user_input = wait.until(EC.element_to_be_clickable((By.XPATH, cfg.XPATH_LOGIN_USER)))
+            user_input.clear()
+            user_input.send_keys(cfg.ROUTER_USERNAME)
+            pass_input = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_LOGIN_PASS)))
+            pass_input.clear()
+            js_set_input_value(driver, pass_input, cfg.ROUTER_PASSWORD)
+            receive_monitor(float(_cfg("CASE11_GUI_AFTER_LOGIN_INPUT_WAIT", 0.5)))
+            submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']")))
+            driver.execute_script("arguments[0].click();", submit_btn)
+            wait_loading_done(wait)
+            receive_monitor(float(_cfg("CASE11_GUI_AFTER_LOGIN_WAIT", 2)))
+
+        step = "navigate to WiFi Settings"
+        wifi_link = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_WIFI_SETTINGS)))
+        js_click(driver, wifi_link)
+        receive_monitor(float(_cfg("CASE11_GUI_WIFI_PAGE_WAIT", 10)))
+
+        step = "open Guest WiFi tab"
+        guest_tab = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_GUEST_WIFI_TAB)))
+        js_click(driver, guest_tab)
+        handle_discard_changes_modal(driver, note="after clicking Guest tab (cleanup)")
+        receive_monitor(float(_cfg("CASE11_GUI_GUEST_PAGE_WAIT", 5)))
+
+        step = "disable Guest WiFi toggle"
+        toggled = set_guest_wifi_enabled(driver, wait, enable=False)
+        if toggled:
+            step = "click Apply"
+            apply_btn = wait.until(EC.presence_of_element_located((By.XPATH, cfg.XPATH_GUEST_WIFI_APPLY_BTN)))
+            js_click(driver, apply_btn)
+            receive_monitor(float(_cfg("CASE11_GUI_AFTER_APPLY_CLICK_WAIT", 1)))
+            wait_loading_done(wait)
+            receive_monitor(float(_cfg("CASE11_GUI_AFTER_APPLY_DONE_WAIT", 2)))
+            save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_cleanup_guest_wifi_disabled")
+            log_result("Case11 cleanup PASS: Guest WiFi disabled")
+        else:
+            log_result("Case11 cleanup PASS: Guest WiFi was already disabled")
+        return True, "None"
+
+    except Exception as e:
+        reason = gui_failure.describe_gui_exception(e, f"cleanup: {step}", cfg.WAIT_TIMEOUT)
+        log_progress(f"[GUI_FAIL] cleanup raw exception: {type(e).__name__}: {str(e)[:300]!r}")
+        save_gui_screenshot(driver, f"{cfg.TEST_CASE_NAME}_cleanup_gui_fail_{step}")
+        return False, reason
+
+    finally:
+        if driver:
+            try:
+                receive_monitor(float(_cfg("CASE11_GUI_BEFORE_QUIT_WAIT", 3)))
+                driver.quit()
+            except Exception:
+                pass
+
+
+def cleanup_guest_wifi():
+    """Run the Guest-disable cleanup (retry, best effort). A cleanup problem is logged but never changes the case result."""
+    if not _cfg("CASE11_CLEANUP_DISABLE_GUEST_WIFI", False):
+        return
+    try:
+        ok, reason = gui_failure.run_with_retry(
+            disable_guest_wifi_by_gui,
+            _cfg("CASE11_GUI_MAX_ATTEMPTS", 2),
+            _cfg("CASE11_GUI_RETRY_WAIT", 30),
+            "Case11 cleanup GUI",
+        )
+        if not ok:
+            log_result(f"Case11 cleanup FAIL: Guest WiFi may still be enabled ({reason}); case result is not changed")
+    except Exception as e:
+        log_result(f"Case11 cleanup FAIL: {type(e).__name__}: {e}; case result is not changed")
 
 
 def run_test():
+    """Run the case, then (PASS, FAIL or interrupt) leave the Guest WiFi disabled.
+
+    The cleanup runs after the case body so that on FAIL the fail diagnostic is collected first, with the Guest WiFi
+    still in the state it had when the case failed."""
+    rc = 1
+    try:
+        rc = _run_test_body()
+    finally:
+        cleanup_guest_wifi()
+        # The cleanup adds many lines after the case result; repeat the result as the last PROGRESS line of the log.
+        verdict = "PASS" if rc == 0 else ("INTERRUPTED" if rc == 130 else "FAIL")
+        log_separator(f"Case11 最終結果: {verdict} (exit code {rc}; Guest WiFi 收尾已在上方完成)")
+        log_result(f"{cfg.TEST_CASE_NAME}: FINAL RESULT {verdict}")
+    return rc
+
+
+def _run_test_body():
     try:
         router_fw, booster_fw = get_environment_fw_versions_close_browser()
         init_summary_log(router_fw, booster_fw)
