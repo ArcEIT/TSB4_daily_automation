@@ -110,11 +110,11 @@ def build_steps() -> list[Step]:
     ]
 
     return [
-        Step("initial_wait", "Initial wait", sleep_s=10),
-        Step("fw_upgrade", "Firmware upgrade", py("Download_fw_then_upgrade.py"), 300, enabled=ENABLE_FW_UPGRADE),
+        Step("initial_wait", "Initial wait", sleep_s=5),
+        Step("fw_upgrade", "Firmware upgrade", py("Download_fw_then_upgrade.py"), 60, enabled=ENABLE_FW_UPGRADE),
         # Start every run from a clean TSM4 (leftovers from manual tests / the previous run are removed).
         # The 300s wait lets the TSM4 boot and its MAP controller come up before case1 resets the RE and onboards it.
-        Step("initial_factory", "Initial TSM4 GUI Factory Default", py("tsm4_gui_factory_default_standalone.py"), 300),
+        Step("TSM4_factory", "Initial TSM4 GUI Factory Default", py("tsm4_gui_factory_default_standalone.py"), 500),
         *selected_cases,
         Step("crash_summary", "Scan Console logs for Kernel panic / crash (standalone)", py("post_run_crash_summary.py"), 60),
         Step("collect", "Collect all log / diag then email (main)", py("TSB4_collect_zip_upload_sftp_then_email_v8_clean_sftp_email.py"), 60),
