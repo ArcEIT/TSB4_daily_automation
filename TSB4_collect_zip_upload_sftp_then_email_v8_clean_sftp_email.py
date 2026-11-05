@@ -46,10 +46,10 @@ def send_email(subject, body, attachments=None):
     # receiver = 'bill_chen@arcadyan.com'
     receivers = [
     'bill_chen@arcadyan.com',
-    'zach_chu@arcadyan.com',
-    'tony_chou@arcadyan.com',
+    #'zach_chu@arcadyan.com',
+    #'tony_chou@arcadyan.com',
     #'dennis_chiang@arcadyan.com',
-    'quantum_wu@arcadyan.com',    
+    #'quantum_wu@arcadyan.com',    
     ]
     app_password = 'qscczpuildgotvji'
 
