@@ -92,7 +92,7 @@ def build_steps() -> list[Step]:
     loops_arg = ["--loops", str(DEFAULT_LOOPS)]
 
     selected_cases = [
-        Step("case1", "Case 1 Factory Default Onboarding", py("cases/case1_re_factory_default_modular.py", *loops_arg), 300),
+        Step("case1", "Case 1 Factory Default Onboarding", py("cases/case1_re_factory_default_modular.py", *loops_arg), 180),
         #Step("case1", "Case 1 Factory Default Onboarding", py("cases/case1_re_factory_default_modular.py", "--loops", "5"), 180),
         Step("case2", "Case 2 Standard Onboarding", py("cases/case2_eth_wifi_onboarding_modular.py", *loops_arg), 180),
         Step("case3", "Case 3 Warm Reboot Onboarding", py("cases/case3_re_warm_reboot_modular.py", *loops_arg), 180),
